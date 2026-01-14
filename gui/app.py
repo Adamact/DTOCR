@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from DTOCR.services.template_service import TemplateService
+from DTOCR.gui.template_editor import TemplateEditor
 
 
 class App:
@@ -12,7 +13,7 @@ class App:
 
         self.root = tk.Tk()
         self.root.title("OCR App (MVP Skeleton)")
-        self.root.geometry("700x420")
+        self.root.geometry("700x600")
 
         self._build_ui()
         self._refresh_templates()
@@ -62,7 +63,11 @@ class App:
 
         self.tree.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Button(container, text="Refresh", command=self._refresh_templates).pack(anchor="e", pady=(10, 0))
+        actions = ttk.Frame(container)
+        actions.pack(anchor="e", pady=(10, 0))
+        ttk.Button(actions, text="Refresh", command=self._refresh_templates).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Edit Template Regions", command=self._on_edit_template).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Delete Template", command=self._on_delete_template).pack(side=tk.LEFT, padx=4)
 
     def _on_create_template(self) -> None:
         name = self.name_var.get().strip()
@@ -99,3 +104,32 @@ class App:
                 "end",
                 values=(t["id"], t["name"], t["vendor"], t["document_type"], t["created_at"]),
             )
+
+    def _on_edit_template(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Template", "Please select a template to edit.")
+            return
+        item = self.tree.item(selection[0])
+        template_id = int(item["values"][0])
+        payload = self.template_service.load_latest_template_payload(template_id)
+        if not payload:
+            messagebox.showerror("Missing Template", "No template payload found for this template.")
+            return
+        TemplateEditor(self.root, self.template_service, template_id, payload)
+
+    def _on_delete_template(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Template", "Please select a template to delete.")
+            return
+        item = self.tree.item(selection[0])
+        template_id = int(item["values"][0])
+        template_name = item["values"][1]
+        if not messagebox.askyesno(
+            "Delete Template",
+            f"Delete template '{template_name}' and all saved versions?",
+        ):
+            return
+        self.template_service.delete_template(template_id)
+        self._refresh_templates()

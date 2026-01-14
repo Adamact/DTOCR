@@ -23,3 +23,6 @@ class TemplateService:
 
     def load_latest_template_payload(self, template_id: int) -> dict[str, Any] | None:
         return self.template_repo.get_latest_version_payload(template_id=template_id)
+
+    def delete_template(self, template_id: int) -> None:
+        self.template_repo.delete_template(template_id=template_id)

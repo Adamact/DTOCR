@@ -72,3 +72,9 @@ class TemplateRepository:
             if row is None:
                 return None
             return json.loads(row["payload_json"])
+
+    def delete_template(self, template_id: int) -> None:
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM template_versions WHERE template_id = ?", (template_id,))
+            conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+            conn.commit()
