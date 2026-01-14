@@ -20,3 +20,7 @@ ON template_versions(template_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_template_versions_unique
 ON template_versions(template_id, version);
+
+CREATE TABLE IF NOT EXISTS label_options (
+    name TEXT PRIMARY KEY
+);

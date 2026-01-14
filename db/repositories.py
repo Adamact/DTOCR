@@ -78,3 +78,13 @@ class TemplateRepository:
             conn.execute("DELETE FROM template_versions WHERE template_id = ?", (template_id,))
             conn.execute("DELETE FROM templates WHERE id = ?", (template_id,))
             conn.commit()
+
+    def list_label_options(self) -> list[str]:
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT name FROM label_options ORDER BY name").fetchall()
+            return [row["name"] for row in rows]
+
+    def seed_label_options(self, labels: list[str]) -> None:
+        with self.db.connect() as conn:
+            conn.executemany("INSERT OR IGNORE INTO label_options(name) VALUES (?)", [(label,) for label in labels])
+            conn.commit()

@@ -116,7 +116,8 @@ class App:
         if not payload:
             messagebox.showerror("Missing Template", "No template payload found for this template.")
             return
-        TemplateEditor(self.root, self.template_service, template_id, payload)
+        label_options = self.template_service.list_label_options()
+        TemplateEditor(self.root, self.template_service, template_id, payload, label_options)
 
     def _on_delete_template(self) -> None:
         selection = self.tree.selection()

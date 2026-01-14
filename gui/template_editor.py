@@ -34,16 +34,6 @@ class Region:
         }
 
 
-LABEL_OPTIONS = (
-    "invoice_number",
-    "invoice_date",
-    "invoice_total",
-    "vendor_name",
-    "bill_to",
-    "ship_to",
-)
-
-
 class TemplateEditor:
     def __init__(
         self,
@@ -51,10 +41,12 @@ class TemplateEditor:
         template_service: TemplateService,
         template_id: int,
         template_payload: dict[str, Any],
+        label_options: list[str],
     ) -> None:
         self.template_service = template_service
         self.template_id = template_id
         self.template_payload = template_payload
+        self.label_options = label_options
         self.regions: list[Region] = [
             Region(
                 region_id=region.get("id", str(uuid4())),
@@ -81,7 +73,7 @@ class TemplateEditor:
         self.canvas_image_id: int | None = None
         self.canvas_rect_id: int | None = None
         self.canvas_region_map: dict[str, int] = {}
-        self.drag_start: tuple[int, int] | None = None
+        self.drag_start: tuple[float, float] | None = None
 
         self._build_ui()
 
@@ -202,23 +194,28 @@ class TemplateEditor:
     def _on_canvas_press(self, event: tk.Event) -> None:
         if not self.doc:
             return
-        self.drag_start = (event.x, event.y)
+        start_x = self.canvas.canvasx(event.x)
+        start_y = self.canvas.canvasy(event.y)
+        self.drag_start = (start_x, start_y)
         if self.canvas_rect_id:
             self.canvas.delete(self.canvas_rect_id)
         self.canvas_rect_id = self.canvas.create_rectangle(
-            event.x, event.y, event.x, event.y, outline="#ff7043", width=2, dash=(4, 2)
+            start_x, start_y, start_x, start_y, outline="#ff7043", width=2, dash=(4, 2)
         )
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
         if not self.drag_start or not self.canvas_rect_id:
             return
-        self.canvas.coords(self.canvas_rect_id, self.drag_start[0], self.drag_start[1], event.x, event.y)
+        current_x = self.canvas.canvasx(event.x)
+        current_y = self.canvas.canvasy(event.y)
+        self.canvas.coords(self.canvas_rect_id, self.drag_start[0], self.drag_start[1], current_x, current_y)
 
     def _on_canvas_release(self, event: tk.Event) -> None:
         if not self.drag_start or not self.canvas_rect_id:
             return
         start_x, start_y = self.drag_start
-        end_x, end_y = event.x, event.y
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
         self.drag_start = None
 
         x1, x2 = sorted([start_x, end_x])
@@ -281,8 +278,13 @@ class TemplateEditor:
         dialog.grab_set()
 
         ttk.Label(dialog, text="Label").pack(anchor="w", padx=12, pady=(12, 4))
-        label_var = tk.StringVar(value=LABEL_OPTIONS[0] if LABEL_OPTIONS else "")
-        label_box = ttk.Combobox(dialog, textvariable=label_var, values=LABEL_OPTIONS, state="readonly")
+        label_var = tk.StringVar(value=self.label_options[0] if self.label_options else "")
+        label_box = ttk.Combobox(
+            dialog,
+            textvariable=label_var,
+            values=self.label_options,
+            state="readonly",
+        )
         label_box.pack(fill=tk.X, padx=12, pady=(0, 12))
 
         result: list[str | None] = [None]

@@ -10,6 +10,15 @@ from DTOCR.db.repositories import TemplateRepository # type: ignore
 class TemplateService:
     template_repo: TemplateRepository
 
+    DEFAULT_LABEL_OPTIONS = [
+        "invoice_number",
+        "invoice_date",
+        "invoice_total",
+        "vendor_name",
+        "bill_to",
+        "ship_to",
+    ]
+
     def create_template(self, name: str, vendor: str, document_type: str) -> int:
         # Place for validation rules later
         return self.template_repo.create_template(name=name, vendor=vendor, document_type=document_type)
@@ -26,3 +35,10 @@ class TemplateService:
 
     def delete_template(self, template_id: int) -> None:
         self.template_repo.delete_template(template_id=template_id)
+
+    def list_label_options(self) -> list[str]:
+        labels = self.template_repo.list_label_options()
+        if not labels:
+            self.template_repo.seed_label_options(self.DEFAULT_LABEL_OPTIONS)
+            labels = self.template_repo.list_label_options()
+        return labels
