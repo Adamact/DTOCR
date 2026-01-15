@@ -24,3 +24,13 @@ ON template_versions(template_id, version);
 CREATE TABLE IF NOT EXISTS label_options (
     name TEXT PRIMARY KEY
 );
+
+DELETE FROM label_options
+WHERE rowid NOT IN (
+    SELECT MIN(rowid)
+    FROM label_options
+    GROUP BY lower(name)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_label_options_name_nocase
+ON label_options(name COLLATE NOCASE);

@@ -88,3 +88,18 @@ class TemplateRepository:
         with self.db.connect() as conn:
             conn.executemany("INSERT OR IGNORE INTO label_options(name) VALUES (?)", [(label,) for label in labels])
             conn.commit()
+
+    def add_label_option(self, label: str) -> None:
+        with self.db.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO label_options(name) VALUES (?)", (label,))
+            conn.commit()
+
+    def delete_label_option(self, label: str) -> None:
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM label_options WHERE name = ?", (label,))
+            conn.commit()
+
+    def rename_label_option(self, old_label: str, new_label: str) -> None:
+        with self.db.connect() as conn:
+            conn.execute("UPDATE label_options SET name = ? WHERE name = ?", (new_label, old_label))
+            conn.commit()

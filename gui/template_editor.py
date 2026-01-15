@@ -16,6 +16,7 @@ from DTOCR.services.template_service import TemplateService
 class Region:
     region_id: str
     page: int
+    page_scope: str
     label: str
     x: float
     y: float
@@ -26,6 +27,7 @@ class Region:
         return {
             "id": self.region_id,
             "page": self.page,
+            "page_scope": self.page_scope,
             "label": self.label,
             "x": self.x,
             "y": self.y,
@@ -35,6 +37,12 @@ class Region:
 
 
 class TemplateEditor:
+    PAGE_SCOPES = ("first", "middle", "last", "specific")
+    REGION_OUTLINE_COLOR = "#1976d2"
+    REGION_SELECTED_COLOR = "#d32f2f"
+    REGION_OUTLINE_WIDTH = 2
+    REGION_SELECTED_WIDTH = 3
+
     def __init__(
         self,
         parent: tk.Tk,
@@ -51,6 +59,7 @@ class TemplateEditor:
             Region(
                 region_id=region.get("id", str(uuid4())),
                 page=region.get("page", 1),
+                page_scope=region.get("page_scope", "specific"),
                 label=region.get("label", ""),
                 x=region.get("x", 0.0),
                 y=region.get("y", 0.0),
@@ -60,6 +69,7 @@ class TemplateEditor:
             for region in template_payload.get("regions", [])
         ]
         self.source_pdf = template_payload.get("source_pdf", "")
+        self.dpi_var = tk.StringVar(value=str(template_payload.get("dpi", 300)))
 
         self.window = tk.Toplevel(parent)
         self.window.title(f"Template Editor: {template_payload.get('name', '')}")
@@ -130,6 +140,9 @@ class TemplateEditor:
         self.region_list.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
         self.region_list.bind("<<ListboxSelect>>", self._on_region_select)
 
+        ttk.Label(sidebar, text="Crop DPI").pack(anchor="w", pady=(4, 0))
+        ttk.Spinbox(sidebar, from_=72, to=600, textvariable=self.dpi_var, width=8).pack(anchor="w", pady=(0, 8))
+
         ttk.Button(sidebar, text="Delete Region", command=self._delete_region).pack(fill=tk.X)
         ttk.Button(sidebar, text="Save Template", command=self._save_template).pack(fill=tk.X, pady=(8, 0))
 
@@ -168,15 +181,23 @@ class TemplateEditor:
         self.canvas_region_map.clear()
         self.region_list.delete(0, tk.END)
         current_page = self.page_index + 1
+        page_count = self.doc.page_count if self.doc else 0
         for region in self.regions:
-            display_text = f"{region.label} (p{region.page})"
+            display_text = self._region_display_text(region)
             self.region_list.insert(tk.END, display_text)
-            if region.page == current_page:
+            if self._region_applies_to_page(region, current_page, page_count):
                 x1 = region.x * self.page_scale
                 y1 = region.y * self.page_scale
                 x2 = (region.x + region.width) * self.page_scale
                 y2 = (region.y + region.height) * self.page_scale
-                rect_id = self.canvas.create_rectangle(x1, y1, x2, y2, outline="#1976d2", width=2)
+                rect_id = self.canvas.create_rectangle(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    outline=self.REGION_OUTLINE_COLOR,
+                    width=self.REGION_OUTLINE_WIDTH,
+                )
                 self.canvas_region_map[region.region_id] = rect_id
 
     def _prev_page(self) -> None:
@@ -225,7 +246,7 @@ class TemplateEditor:
             self.canvas_rect_id = None
             return
 
-        label = self._prompt_label()
+        label, page_scope = self._prompt_region_metadata()
         if not label:
             self.canvas.delete(self.canvas_rect_id)
             self.canvas_rect_id = None
@@ -234,6 +255,7 @@ class TemplateEditor:
         region = Region(
             region_id=str(uuid4()),
             page=self.page_index + 1,
+            page_scope=page_scope,
             label=label,
             x=x1 / self.page_scale,
             y=y1 / self.page_scale,
@@ -246,15 +268,27 @@ class TemplateEditor:
 
     def _on_region_select(self, _: tk.Event) -> None:
         selection = self.region_list.curselection()
+        for rect_id in self.canvas_region_map.values():
+            self.canvas.itemconfig(
+                rect_id,
+                outline=self.REGION_OUTLINE_COLOR,
+                width=self.REGION_OUTLINE_WIDTH,
+            )
         if not selection:
             return
         index = selection[0]
         region = self.regions[index]
-        if region.page != self.page_index + 1:
+        current_page = self.page_index + 1
+        page_count = self.doc.page_count if self.doc else 0
+        if not self._region_applies_to_page(region, current_page, page_count):
             return
         rect_id = self.canvas_region_map.get(region.region_id)
         if rect_id:
-            self.canvas.itemconfig(rect_id, outline="#d32f2f", width=3)
+            self.canvas.itemconfig(
+                rect_id,
+                outline=self.REGION_SELECTED_COLOR,
+                width=self.REGION_SELECTED_WIDTH,
+            )
 
     def _delete_region(self) -> None:
         selection = self.region_list.curselection()
@@ -268,10 +302,18 @@ class TemplateEditor:
         payload = dict(self.template_payload)
         payload["regions"] = [region.to_payload() for region in self.regions]
         payload["source_pdf"] = self.source_pdf
+        payload["dpi"] = self._parse_dpi()
         self.template_service.save_template_version(template_id=self.template_id, payload=payload)
         messagebox.showinfo("Saved", "Template regions saved.")
 
-    def _prompt_label(self) -> str | None:
+    def _parse_dpi(self) -> int:
+        try:
+            dpi = int(self.dpi_var.get())
+        except ValueError:
+            dpi = 300
+        return max(72, min(dpi, 600))
+
+    def _prompt_region_metadata(self) -> tuple[str | None, str]:
         dialog = tk.Toplevel(self.window)
         dialog.title("Select Region Label")
         dialog.transient(self.window)
@@ -287,10 +329,23 @@ class TemplateEditor:
         )
         label_box.pack(fill=tk.X, padx=12, pady=(0, 12))
 
-        result: list[str | None] = [None]
+        ttk.Label(dialog, text="Page Scope").pack(anchor="w", padx=12, pady=(0, 4))
+        default_scope = self._default_page_scope()
+        scope_var = tk.StringVar(value=default_scope)
+        scope_box = ttk.Combobox(
+            dialog,
+            textvariable=scope_var,
+            values=list(self.PAGE_SCOPES),
+            state="readonly",
+        )
+        scope_box.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        result_label: list[str | None] = [None]
+        result_scope: list[str] = [default_scope]
 
         def on_ok() -> None:
-            result[0] = label_var.get()
+            result_label[0] = label_var.get()
+            result_scope[0] = scope_var.get()
             dialog.destroy()
 
         def on_cancel() -> None:
@@ -302,7 +357,34 @@ class TemplateEditor:
         ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.RIGHT, padx=6)
 
         dialog.wait_window()
-        return result[0]
+        return result_label[0], result_scope[0]
+
+    def _default_page_scope(self) -> str:
+        if not self.doc:
+            return "specific"
+        if self.doc.page_count == 1:
+            return "first"
+        if self.page_index == 0:
+            return "first"
+        if self.page_index == self.doc.page_count - 1:
+            return "last"
+        return "middle"
+
+    def _region_display_text(self, region: Region) -> str:
+        if region.page_scope == "specific":
+            return f"{region.label} (p{region.page})"
+        return f"{region.label} ({region.page_scope})"
+
+    def _region_applies_to_page(self, region: Region, page_number: int, page_count: int) -> bool:
+        if region.page_scope == "specific":
+            return region.page == page_number
+        if region.page_scope == "first":
+            return page_number == 1
+        if region.page_scope == "last":
+            return page_count > 0 and page_number == page_count
+        if region.page_scope == "middle":
+            return page_count > 2 and 1 < page_number < page_count
+        return False
 
     def _apply_zoom(self, factor: float) -> None:
         if not self.doc:

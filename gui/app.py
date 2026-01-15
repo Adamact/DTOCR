@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from DTOCR.services.template_service import TemplateService
 from DTOCR.gui.template_editor import TemplateEditor
@@ -67,6 +67,9 @@ class App:
         actions.pack(anchor="e", pady=(10, 0))
         ttk.Button(actions, text="Refresh", command=self._refresh_templates).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Edit Template Regions", command=self._on_edit_template).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Manage Labels", command=self._on_manage_labels).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Apply Template to PDF", command=self._on_apply_template).pack(side=tk.LEFT, padx=4)
+        ttk.Button(actions, text="Run OCR Pipeline", command=self._on_run_ocr).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Delete Template", command=self._on_delete_template).pack(side=tk.LEFT, padx=4)
 
     def _on_create_template(self) -> None:
@@ -87,6 +90,7 @@ class App:
             "vendor": vendor,
             "document_type": doc_type,
             "regions": [],
+            "dpi": 300,
         }
         self.template_service.save_template_version(template_id=template_id, payload=payload)
 
@@ -134,3 +138,134 @@ class App:
             return
         self.template_service.delete_template(template_id)
         self._refresh_templates()
+
+    def _on_manage_labels(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Manage Labels")
+        window.geometry("360x420")
+        window.transient(self.root)
+        window.grab_set()
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="Labels").pack(anchor="w")
+        labels_list = tk.Listbox(container, height=14)
+        labels_list.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
+
+        entry_var = tk.StringVar()
+        ttk.Label(container, text="Label Name").pack(anchor="w")
+        entry = ttk.Entry(container, textvariable=entry_var)
+        entry.pack(fill=tk.X, pady=(0, 8))
+
+        def refresh() -> None:
+            labels_list.delete(0, tk.END)
+            for label in self.template_service.list_label_options():
+                labels_list.insert(tk.END, label)
+
+        def add_label() -> None:
+            label = entry_var.get().strip()
+            if not label:
+                messagebox.showwarning("Label", "Label name cannot be empty.")
+                return
+            if not self.template_service.add_label_option(label):
+                messagebox.showwarning("Label", "Label already exists.")
+                return
+            entry_var.set("")
+            refresh()
+
+        def delete_label() -> None:
+            selection = labels_list.curselection()
+            if not selection:
+                messagebox.showwarning("Label", "Select a label to delete.")
+                return
+            label = labels_list.get(selection[0])
+            if not messagebox.askyesno("Delete Label", f"Delete label '{label}'?"):
+                return
+            self.template_service.delete_label_option(label)
+            refresh()
+
+        def rename_label() -> None:
+            selection = labels_list.curselection()
+            if not selection:
+                messagebox.showwarning("Label", "Select a label to rename.")
+                return
+            old_label = labels_list.get(selection[0])
+            new_label = entry_var.get().strip()
+            if not new_label:
+                messagebox.showwarning("Label", "New label name cannot be empty.")
+                return
+            if not self.template_service.rename_label_option(old_label, new_label):
+                messagebox.showwarning("Label", "Rename failed. Label may already exist.")
+                return
+            entry_var.set("")
+            refresh()
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(button_row, text="Add", command=add_label).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Rename", command=rename_label).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="Delete", command=delete_label).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Refresh", command=refresh).pack(side=tk.RIGHT)
+
+        refresh()
+
+    def _on_apply_template(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Template", "Please select a template to apply.")
+            return
+        item = self.tree.item(selection[0])
+        template_id = int(item["values"][0])
+        payload = self.template_service.load_latest_template_payload(template_id)
+        if not payload:
+            messagebox.showerror("Missing Template", "No template payload found for this template.")
+            return
+        pdf_path = filedialog.askopenfilename(
+            title="Select PDF",
+            filetypes=[("PDF Files", "*.pdf")],
+        )
+        if not pdf_path:
+            return
+        result = self.template_service.apply_template_to_pdf(payload, pdf_path)
+        crops = result.get("crops", [])
+        output_dir = result.get("output_dir", "")
+        if not crops:
+            messagebox.showinfo("No Regions", "No regions were found to crop for this template.")
+            return
+        messagebox.showinfo(
+            "Template Applied",
+            f"Saved {len(crops)} crops to:\n{output_dir}",
+        )
+
+    def _on_run_ocr(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Select Template", "Please select a template to apply.")
+            return
+        item = self.tree.item(selection[0])
+        template_id = int(item["values"][0])
+        payload = self.template_service.load_latest_template_payload(template_id)
+        if not payload:
+            messagebox.showerror("Missing Template", "No template payload found for this template.")
+            return
+        pdf_path = filedialog.askopenfilename(
+            title="Select PDF",
+            filetypes=[("PDF Files", "*.pdf")],
+        )
+        if not pdf_path:
+            return
+        try:
+            result = self.template_service.run_ocr_pipeline(payload, pdf_path)
+        except RuntimeError as exc:
+            messagebox.showerror("OCR Unavailable", str(exc))
+            return
+        results = result.get("results", [])
+        output_dir = result.get("output_dir", "")
+        if not results:
+            messagebox.showinfo("No OCR Results", "No regions were found to parse.")
+            return
+        messagebox.showinfo(
+            "OCR Complete",
+            f"Parsed {len(results)} regions.\nOutput:\n{output_dir}",
+        )
