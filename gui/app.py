@@ -255,8 +255,15 @@ class App:
         )
         if not pdf_path:
             return
+        # Ask user where to save Excel (optional). Cancel to skip Excel export.
+        excel_save = filedialog.asksaveasfilename(
+            title="Save OCR Results as Excel (optional) - Cancel to skip",
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx")],
+        )
+        excel_path = excel_save or None
         try:
-            result = self.template_service.run_ocr_pipeline(payload, pdf_path)
+            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path)
         except RuntimeError as exc:
             messagebox.showerror("OCR Unavailable", str(exc))
             return
@@ -265,7 +272,15 @@ class App:
         if not results:
             messagebox.showinfo("No OCR Results", "No regions were found to parse.")
             return
+        # Build informative completion message
+        msg = f"Parsed {len(results)} regions.\nOutput:\n{output_dir}"
+        ocr_out = result.get("ocr_output_path", "")
+        if ocr_out:
+            msg += f"\nOCR JSON:\n{ocr_out}"
+        excel_out = result.get("excel_output_path", "")
+        if excel_out:
+            msg += f"\nExcel:\n{excel_out}"
         messagebox.showinfo(
             "OCR Complete",
-            f"Parsed {len(results)} regions.\nOutput:\n{output_dir}",
+            msg,
         )
