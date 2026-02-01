@@ -6,6 +6,26 @@ from tkinter import ttk, messagebox, filedialog
 from DTOCR.services.template_service import TemplateService
 from DTOCR.gui.template_editor import TemplateEditor
 
+# PIL is optional (for annotated image viewer). If missing, the viewer falls back to telling user where images were saved.
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
+
+# PyMuPDF (fitz) is optional and used to render PDF pages for preview
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+import glob
+import os
+import tempfile
+import shutil
+import logging
+from pathlib import Path
+
 
 class App:
     def __init__(self, template_service: TemplateService) -> None:
@@ -63,6 +83,45 @@ class App:
 
         self.tree.pack(fill=tk.BOTH, expand=True)
 
+        # Small settings area for preprocessing controls
+        settings = ttk.Frame(container)
+        settings.pack(fill=tk.X, pady=(8, 6))
+        ttk.Label(settings, text="Preproc: Word kernel divisor (smaller = more merging)").pack(side=tk.LEFT, padx=(0,8))
+        self.word_kernel_divisor_var = tk.IntVar(value=15)
+        self.word_kernel_spin = ttk.Spinbox(settings, from_=5, to=40, textvariable=self.word_kernel_divisor_var, width=5)
+        self.word_kernel_spin.pack(side=tk.LEFT)
+
+        # Live preview controls
+        self.preview_image_path: str | None = None
+        self.preview_img_photo = None
+        self.live_preview_var = tk.BooleanVar(value=False)
+        # PDF preview state: whether the selected preview is a PDF and which page to render
+        self.preview_is_pdf = False
+        self.preview_pdf_page_var = tk.IntVar(value=1)
+        self.preview_page_spin: ttk.Spinbox | None = None
+
+        # Preview selection and controls
+        preview_sel = ttk.Frame(container)
+        preview_sel.pack(fill=tk.X, pady=(6, 6))
+        ttk.Button(preview_sel, text="Select Preview Image", command=self._on_select_preview_image).pack(side=tk.LEFT)
+        self.preview_path_lbl = ttk.Label(preview_sel, text="No preview image selected", width=60)
+        self.preview_path_lbl.pack(side=tk.LEFT, padx=8)
+        # Page selector for PDFs (disabled for image files until a PDF is selected)
+        ttk.Label(preview_sel, text="Page:").pack(side=tk.LEFT, padx=(6,0))
+        self.preview_page_spin = ttk.Spinbox(preview_sel, from_=1, to=1, textvariable=self.preview_pdf_page_var, width=4, state="disabled")
+        self.preview_page_spin.pack(side=tk.LEFT, padx=4)
+        ttk.Checkbutton(preview_sel, text="Live Preview", variable=self.live_preview_var).pack(side=tk.LEFT, padx=6)
+        ttk.Button(preview_sel, text="Preview", command=self._on_preview).pack(side=tk.LEFT, padx=6)
+        # Trace changes: auto preview when divisor changes or live preview toggled
+        try:
+            self.word_kernel_divisor_var.trace_add("write", self._on_divisor_change)
+            self.live_preview_var.trace_add("write", lambda *a: self._on_preview() if self.live_preview_var.get() and self.preview_image_path else None)
+            # When the selected PDF page changes, update preview if live preview is enabled
+            self.preview_pdf_page_var.trace_add("write", lambda *a: self._on_preview() if self.live_preview_var.get() and self.preview_is_pdf else None)
+        except Exception:
+            # Older tkinter versions may not support trace_add; ignore
+            pass
+
         actions = ttk.Frame(container)
         actions.pack(anchor="e", pady=(10, 0))
         ttk.Button(actions, text="Refresh", command=self._refresh_templates).pack(side=tk.LEFT, padx=4)
@@ -71,6 +130,51 @@ class App:
         ttk.Button(actions, text="Apply Template to PDF", command=self._on_apply_template).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Run OCR Pipeline", command=self._on_run_ocr).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Delete Template", command=self._on_delete_template).pack(side=tk.LEFT, padx=4)
+
+        # Preview pane with scrollable canvas and zoom controls
+        preview_frame = ttk.LabelFrame(container, text="Preview", padding=6)
+        preview_frame.pack(fill=tk.BOTH, expand=False, pady=(6, 12))
+
+        # Zoom controls
+        zoom_row = ttk.Frame(preview_frame)
+        zoom_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(zoom_row, text="-", width=3, command=lambda: self._change_zoom(-10)).pack(side=tk.LEFT)
+        self.zoom_var = tk.IntVar(value=100)
+        self.zoom_label = ttk.Label(zoom_row, textvariable=tk.StringVar(value=f"{self.zoom_var.get()}%"))
+        self.zoom_label.pack(side=tk.LEFT, padx=(6,4))
+        self.zoom_scale = ttk.Scale(zoom_row, from_=10, to=400, orient=tk.HORIZONTAL, command=lambda v: self._set_zoom(int(float(v))), value=100)
+        self.zoom_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,6))
+        ttk.Button(zoom_row, text="+", width=3, command=lambda: self._change_zoom(10)).pack(side=tk.LEFT)
+        ttk.Button(zoom_row, text="Reset", command=lambda: self._set_zoom(100)).pack(side=tk.LEFT, padx=(6,0))
+
+        # Canvas with scrollbars
+        canvas_row = ttk.Frame(preview_frame)
+        canvas_row.pack(fill=tk.BOTH, expand=True)
+        self.preview_v_scroll = ttk.Scrollbar(canvas_row, orient=tk.VERTICAL)
+        self.preview_h_scroll = ttk.Scrollbar(canvas_row, orient=tk.HORIZONTAL)
+        self.preview_canvas = tk.Canvas(canvas_row, bg="white", xscrollcommand=self.preview_h_scroll.set, yscrollcommand=self.preview_v_scroll.set)
+        self.preview_v_scroll.config(command=self.preview_canvas.yview)
+        self.preview_h_scroll.config(command=self.preview_canvas.xview)
+        self.preview_v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.preview_h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Internal preview state
+        self.preview_pil_image = None
+        self.preview_img_photo = None
+        self.preview_img_id = None
+        # Bind mousewheel for scrolling
+        self.preview_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Update zoom label when zoom_var or scale change
+        def _update_zoom_label(val=None):
+            z = int(self.zoom_var.get())
+            try:
+                self.zoom_label.config(text=f"{z}%")
+                self.zoom_scale.set(z)
+            except Exception:
+                pass
+        self.zoom_var.trace_add("write", lambda *a: _update_zoom_label())
+
 
     def _on_create_template(self) -> None:
         name = self.name_var.get().strip()
@@ -227,7 +331,8 @@ class App:
         )
         if not pdf_path:
             return
-        result = self.template_service.apply_template_to_pdf(payload, pdf_path)
+        divisor = int(self.word_kernel_divisor_var.get() or 15)
+        result = self.template_service.apply_template_to_pdf(payload, pdf_path, word_kernel_divisor=divisor)
         crops = result.get("crops", [])
         output_dir = result.get("output_dir", "")
         if not crops:
@@ -235,9 +340,20 @@ class App:
             return
         messagebox.showinfo(
             "Template Applied",
-            f"Saved {len(crops)} crops to:\n{output_dir}",
+            f"Saved {len(crops)} crops to:\n{output_dir}\n(Annotated images if debug enabled are in {output_dir}/annotated)",
         )
-
+        # If annotated images exist, show them for quick inspection
+        try:
+            self._show_annotated_images(output_dir, divisor)
+        except Exception:
+            # Ignore viewer errors; the files are still saved on disk
+            pass
+        # If a preview image is selected and live preview is enabled, refresh it
+        try:
+            if self.live_preview_var.get() and self.preview_image_path:
+                self._on_preview()
+        except Exception:
+            pass
     def _on_run_ocr(self) -> None:
         selection = self.tree.selection()
         if not selection:
@@ -262,11 +378,18 @@ class App:
             filetypes=[("Excel Files", "*.xlsx")],
         )
         excel_path = excel_save or None
+        divisor = int(self.word_kernel_divisor_var.get() or 15)
         try:
-            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path)
+            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path, word_kernel_divisor=divisor)
         except RuntimeError as exc:
             messagebox.showerror("OCR Unavailable", str(exc))
             return
+        # If a preview image is selected and live preview is enabled, refresh it
+        try:
+            if self.live_preview_var.get() and self.preview_image_path:
+                self._on_preview()
+        except Exception:
+            pass
         results = result.get("results", [])
         output_dir = result.get("output_dir", "")
         if not results:
@@ -284,3 +407,260 @@ class App:
             "OCR Complete",
             msg,
         )
+        # Show annotated images when present (helpful to visualize the chosen kernel)
+        try:
+            self._show_annotated_images(output_dir, divisor)
+        except Exception:
+            pass
+
+    def _show_annotated_images(self, output_dir: str, divisor: int | None = None) -> None:
+        """Open a simple viewer to show annotated images (if any) saved to output_dir/annotated.
+
+        Falls back to a messagebox if Pillow is not available.
+        """
+        annotated_dir = os.path.join(output_dir, "annotated")
+        if not os.path.isdir(annotated_dir):
+            return
+        images = sorted(glob.glob(os.path.join(annotated_dir, "*.png")))
+        if not images:
+            return
+        if Image is None or ImageTk is None:
+            messagebox.showinfo("Annotated Images Saved", f"Annotated images saved to {annotated_dir} (install Pillow to preview)")
+            return
+
+        viewer = tk.Toplevel(self.root)
+        title = f"Annotated Images (word kernel divisor={divisor})" if divisor is not None else "Annotated Images"
+        viewer.title(title)
+        viewer.geometry("800x480")
+
+        canvas = tk.Canvas(viewer, bg="white")
+        h_scroll = ttk.Scrollbar(viewer, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=h_scroll.set)
+
+        frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=frame, anchor="nw")
+
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Load thumbnails
+        for img_path in images:
+            try:
+                img = Image.open(img_path)
+                img.thumbnail((700, 700))
+                photo = ImageTk.PhotoImage(img)
+                lbl = ttk.Label(frame, image=photo, text=os.path.basename(img_path), compound="top")
+                lbl.image = photo
+                lbl.pack(side=tk.LEFT, padx=6, pady=6)
+            except Exception as exc:
+                print("Failed to load annotated image", img_path, exc)
+
+        frame.update_idletasks()
+        canvas.config(scrollregion=canvas.bbox("all"))
+
+    def _on_select_preview_image(self) -> None:
+        try:
+            path = filedialog.askopenfilename(
+                title="Select Preview Image",
+                filetypes=[("Image/PDF Files", "*.png;*.jpg;*.jpeg;*.tif;*.bmp;*.pdf")],
+            )
+            if not path:
+                return
+            self.preview_image_path = path
+            p = Path(path)
+            # PDF selected: enable page selector and read page count
+            if p.suffix.lower() == ".pdf":
+                if fitz is None:
+                    messagebox.showerror("PyMuPDF missing", "Install PyMuPDF (pymupdf) to enable PDF previews")
+                    return
+                try:
+                    doc = fitz.open(path)
+                    page_count = doc.page_count
+                    doc.close()
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Failed to open PDF for preview: %s", exc)
+                    messagebox.showerror("PDF Error", f"Failed to open PDF: {exc}")
+                    return
+                self.preview_is_pdf = True
+                self.preview_pdf_page_var.set(1)
+                try:
+                    # configure spinbox range and enable it
+                    self.preview_page_spin.config(from_=1, to=page_count, state="normal")
+                except Exception:
+                    pass
+                self.preview_path_lbl.config(text=f"{os.path.basename(path)} (pages={page_count})")
+                if self.live_preview_var.get():
+                    try:
+                        self._on_preview()
+                    except Exception as exc:
+                        logging.getLogger(__name__).exception("Live preview failed: %s", exc)
+            else:
+                # Regular image
+                self.preview_is_pdf = False
+                self.preview_pdf_page_var.set(1)
+                try:
+                    self.preview_page_spin.config(state="disabled")
+                except Exception:
+                    pass
+                self.preview_path_lbl.config(text=os.path.basename(path))
+                if self.live_preview_var.get():
+                    try:
+                        self._on_preview()
+                    except Exception as exc:
+                        logging.getLogger(__name__).exception("Live preview failed: %s", exc)
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Preview image selection failed: %s", exc)
+            messagebox.showerror("Preview Error", f"Failed to select preview image: {exc}")
+
+
+    def _on_preview(self) -> None:
+        try:
+            if not self.preview_image_path:
+                messagebox.showwarning("No Preview Image", "Select a preview image first.")
+                return
+            if Image is None or ImageTk is None:
+                messagebox.showinfo("Pillow missing", "Install Pillow to show previews.")
+                return
+            divisor = int(self.word_kernel_divisor_var.get() or 15)
+            # Create a temporary output directory for preview artifacts
+            outdir = Path(tempfile.mkdtemp(prefix="dtocr_preview_"))
+            serv_logger = logging.getLogger("DTOCR.services.template_service")
+            prev_level = serv_logger.getEffectiveLevel()
+            serv_logger.setLevel(logging.DEBUG)
+
+            # If previewing a PDF, render the selected page into a temporary image first
+            temp_rendered_img = None
+            if self.preview_is_pdf:
+                if fitz is None:
+                    messagebox.showerror("PyMuPDF missing", "Install PyMuPDF (pymupdf) to enable PDF previews")
+                    return
+                page_num = int(self.preview_pdf_page_var.get() or 1)
+                try:
+                    doc = fitz.open(self.preview_image_path)
+                    page = doc.load_page(page_num - 1)
+                    # scale up a little for clarity
+                    mat = fitz.Matrix(2.0, 2.0)
+                    pix = page.get_pixmap(matrix=mat)
+                    temp_rendered_img = outdir / f"preview_pdf_page{page_num}.png"
+                    pix.save(str(temp_rendered_img))
+                    doc.close()
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("Failed to render PDF page: %s", exc)
+                    messagebox.showerror("Render Error", f"Failed to render PDF page: {exc}")
+                    shutil.rmtree(outdir, ignore_errors=True)
+                    return
+                source_path = str(temp_rendered_img)
+            else:
+                source_path = self.preview_image_path
+
+            try:
+                subcrops = self.template_service._split_data_field_region(source_path, "preview", 1, outdir, word_kernel_divisor=divisor)
+            finally:
+                serv_logger.setLevel(prev_level)
+
+            # Look for an annotated image first, then a words preproc image, then any preproc image
+            annotated_img = outdir / "annotated"
+            img_path = None
+            if annotated_img.exists():
+                imgs = sorted(annotated_img.glob("*.png"))
+                if imgs:
+                    img_path = imgs[0]
+            if not img_path:
+                preproc_img_dir = outdir / "preproc"
+                if preproc_img_dir.exists():
+                    imgs = sorted(preproc_img_dir.glob("*words*.png")) or sorted(preproc_img_dir.glob("*.png"))
+                    if imgs:
+                        img_path = imgs[0]
+
+            if not img_path:
+                messagebox.showinfo("No preview image", "No annotated/preproc images were produced (no rows detected?).")
+                return
+
+            try:
+                img = Image.open(str(img_path))
+                # Save original PIL image for zooming (we'll resize from this)
+                self.preview_pil_image = img.convert("RGBA")
+                # Set initial zoom and render
+                z = int(self.zoom_var.get() or 100)
+                self._render_preview_image(scale_percent=z)
+            except Exception as exc:
+                logging.getLogger(__name__).exception("Failed to load preview image: %s", exc)
+                messagebox.showerror("Preview Error", f"Failed to load preview image: {exc}")
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Preview failed: %s", exc)
+            messagebox.showerror("Preview failed", f"Preview failed: {exc}\nSee console/log for details")
+        finally:
+            # Remove temp artifacts after loading image into memory
+            try:
+                shutil.rmtree(outdir, ignore_errors=True)
+            except Exception:
+                pass
+    def _on_divisor_change(self, *args) -> None:
+        # Called whenever the divisor is changed; trigger preview if live preview is enabled
+        try:
+            if self.live_preview_var.get() and self.preview_image_path:
+                self._on_preview()
+        except Exception:
+            pass
+
+    def _change_zoom(self, delta_percent: int) -> None:
+        # delta_percent is added to current zoom percent
+        try:
+            new_z = max(10, min(400, int(self.zoom_var.get()) + int(delta_percent)))
+            self._set_zoom(new_z)
+        except Exception:
+            pass
+
+    def _set_zoom(self, percent: int) -> None:
+        # Update zoom variable and re-render current preview image if present
+        percent = max(10, min(400, int(percent)))
+        try:
+            self.zoom_var.set(percent)
+        except Exception:
+            pass
+        if self.preview_pil_image is not None:
+            self._render_preview_image(scale_percent=percent)
+
+    def _render_preview_image(self, scale_percent: int = 100) -> None:
+        """Resize preview image according to scale_percent and display it on canvas with scrollbars."""
+        if self.preview_pil_image is None:
+            return
+        try:
+            orig = self.preview_pil_image
+            w, h = orig.size
+            new_w = max(1, int(w * (scale_percent / 100.0)))
+            new_h = max(1, int(h * (scale_percent / 100.0)))
+            resized = orig.resize((new_w, new_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            self.preview_img_photo = photo
+            # Remove previous image if any
+            if self.preview_img_id is not None:
+                try:
+                    self.preview_canvas.delete(self.preview_img_id)
+                except Exception:
+                    pass
+            self.preview_img_id = self.preview_canvas.create_image(0, 0, anchor="nw", image=photo)
+            # configure canvas scrollregion
+            self.preview_canvas.config(scrollregion=(0, 0, new_w, new_h))
+            # optionally center view
+            try:
+                self.preview_canvas.xview_moveto(0)
+                self.preview_canvas.yview_moveto(0)
+            except Exception:
+                pass
+        except Exception as exc:
+            print("Failed to render preview image", exc)
+
+    def _on_mousewheel(self, event) -> None:
+        # Scroll canvas vertically with mousewheel; if Shift held, scroll horizontally
+        try:
+            if event.state & 0x0001:  # Shift (may vary by platform)
+                # horizontal scroll
+                delta = -1 * (event.delta / 120)
+                self.preview_canvas.xview_scroll(int(delta), "units")
+            else:
+                delta = -1 * (event.delta / 120)
+                self.preview_canvas.yview_scroll(int(delta), "units")
+        except Exception:
+            pass
+

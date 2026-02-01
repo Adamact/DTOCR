@@ -10,10 +10,10 @@ from PIL import Image
 
 @dataclass
 class OCRPipeline:
-    def run(self, crops: list[dict[str, Any]], output_dir: str, excel_path: str | None = None) -> dict[str, Any]:
-        import torch  # type: ignore
+    def run(self, crops: list[dict[str, Any]], output_dir: str, excel_path: str | None = None, batch_size: int = 8, num_beams: int = 1, max_length: int = 128) -> dict[str, Any]:
         import logging
         import sys
+        import torch  # type: ignore
 
         logger = logging.getLogger(__name__)
 
@@ -42,57 +42,77 @@ class OCRPipeline:
             sys.stdout.flush()
 
         if total_work > 0:
-            logger.info("Starting OCR: %s cells across %s pages (estimated work=%s)", total_cells, total_pages, total_work)
+            logger.info("Starting OCR (TrOCR): %s cells across %s pages (estimated work=%s)", total_cells, total_pages, total_work)
             _print_progress(0, total_work)
 
+        # Process in batches for speed
+        def _batches(iterable, n):
+            for i in range(0, len(iterable), n):
+                yield iterable[i : i + n]
+
         with torch.inference_mode():
-            for crop in crops:
-                image_path = crop.get("path", "")
-                if not image_path:
+            for batch in _batches(crops, batch_size):
+                imgs = []
+                metas = []
+                for crop in batch:
+                    image_path = crop.get("path", "")
+                    if not image_path:
+                        continue
+                    try:
+                        img = Image.open(image_path).convert("RGB")
+                    except Exception as exc:
+                        logger.warning("Failed to open image for OCR: %s (%s)", image_path, exc)
+                        imgs.append(None)
+                        metas.append((crop, None))
+                        continue
+                    imgs.append(img)
+                    metas.append((crop, image_path))
+
+                # Prepare batch tensors (filter out None images)
+                valid_imgs = [im for im in imgs if im is not None]
+                if not valid_imgs:
+                    for crop, _ in metas:
+                        results.append({"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": ""})
+                        processed_cells += 1
                     continue
 
-                image = Image.open(image_path).convert("RGB")
-                pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
-
-                generated_ids = model.generate(pixel_values)
-                text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                cleaned = text.strip()
-
-                result_item = {
-                    "label": crop.get("label", ""),
-                    "page": crop.get("page", 0),
-                    "path": image_path,
-                    "text": cleaned,
-                }
-                results.append(result_item)
-
-                # Log and print parsed content for traceability
-                logger.info(
-                    "OCR parsed: label=%s page=%s path=%s text=%s",
-                    result_item["label"],
-                    result_item["page"],
-                    result_item["path"],
-                    cleaned,
-                )
+                pixel_values = processor(images=valid_imgs, return_tensors="pt", padding=True).pixel_values.to(device)
                 try:
-                    # Print a concise, readable block to the console
-                    print(f"OCR parsed | label={result_item['label']} | page={result_item['page']} | path={result_item['path']}")
-                    print(cleaned)
-                    print("---")
-                except Exception:
-                    # Avoid any print errors affecting OCR run
-                    logger.debug("Failed to print OCR result to stdout for %s", result_item["path"]) 
+                    generated_ids = model.generate(pixel_values, num_beams=num_beams, max_length=max_length)
+                    texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+                except Exception as exc:
+                    logger.warning("Model.generate failed on batch: %s", exc)
+                    texts = ["" for _ in valid_imgs]
 
-                # Update progress: cells + pages
-                processed_cells += 1
-                page_num = int(result_item.get("page", 0))
-                if page_num and page_num not in processed_pages_seen:
-                    processed_pages_seen.add(page_num)
-                processed_pages = len(processed_pages_seen)
-                work_done = processed_cells + processed_pages
-                if total_work > 0:
-                    _print_progress(work_done, total_work)
-                    logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
+                # Map back texts to metas in order
+                text_iter = iter(texts)
+                for crop, img_path in metas:
+                    if img_path is None:
+                        text = ""
+                    else:
+                        text = next(text_iter, "").strip()
+                    result_item = {"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": text}
+                    results.append(result_item)
+
+                    # Log and print parsed content for traceability
+                    logger.info("OCR parsed (trocr): label=%s page=%s path=%s text=%s", result_item["label"], result_item["page"], result_item["path"], text)
+                    try:
+                        print(f"OCR parsed | label={result_item['label']} | page={result_item['page']} | path={result_item['path']}")
+                        print(text)
+                        print("---")
+                    except Exception:
+                        logger.debug("Failed to print OCR result to stdout for %s", result_item["path"]) 
+
+                    # Update progress: cells + pages
+                    processed_cells += 1
+                    page_num = int(result_item.get("page", 0))
+                    if page_num and page_num not in processed_pages_seen:
+                        processed_pages_seen.add(page_num)
+                    processed_pages = len(processed_pages_seen)
+                    work_done = processed_cells + processed_pages
+                    if total_work > 0:
+                        _print_progress(work_done, total_work)
+                        logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
 
         # Finalize progress bar
         if total_work > 0:
@@ -124,15 +144,15 @@ class OCRPipeline:
         if not hasattr(self, "_trocr_model"):
             model_name = "microsoft/trocr-large-printed"
 
-            # Force CPU early and avoid any lazy/meta device behavior.
-            device = torch.device("cpu")
+            # Prefer GPU if available
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
             processor = TrOCRProcessor.from_pretrained(model_name)
 
             model = VisionEncoderDecoderModel.from_pretrained(
                 model_name,
                 low_cpu_mem_usage=False,
-                dtype=torch.float32,
+                torch_dtype=torch.float32,
             )
             bad = [n for n, p in model.named_parameters() if p.device.type == "meta"]
             if bad:
@@ -141,14 +161,11 @@ class OCRPipeline:
             model.to(device)
             model.eval()
 
-
             # Extra safety: ensure no parameter is on 'meta'
             for name, p in model.named_parameters():
                 if getattr(p, "device", None) is not None and p.device.type == "meta":
                     raise RuntimeError(
-                        f"Model parameter '{name}' is on meta device. "
-                        "This indicates lazy loading. Try upgrading transformers/torch "
-                        "or disable accelerate/device_map usage."
+                        f"Model parameter '{name}' is on meta device. This indicates lazy loading. Try upgrading transformers/torch or disable accelerate/device_map usage."
                     )
 
             self._trocr_model = model

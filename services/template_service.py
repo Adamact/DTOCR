@@ -86,7 +86,11 @@ class TemplateService:
         self.template_repo.rename_label_option(old_clean, new_clean)
         return True
 
-    def apply_template_to_pdf(self, template_payload: dict[str, Any], pdf_path: str) -> dict[str, Any]:
+    def apply_template_to_pdf(self, template_payload: dict[str, Any], pdf_path: str, word_kernel_divisor: int | None = None) -> dict[str, Any]:
+        """Apply template and optionally control how data_field word-kernel is computed.
+
+        word_kernel_divisor: smaller values produce larger kernels (more aggressive merging).
+        """
         regions = template_payload.get("regions", [])
         if not regions:
             return {"output_dir": "", "crops": []}
@@ -123,7 +127,9 @@ class TemplateService:
                     # If this is a data_field region, try to split into rows/columns
                     if safe_label.startswith("data_field"):
                         try:
-                            subcrops = self._split_data_field_region(str(output_path), label, page_number, output_dir)
+                            subcrops = self._split_data_field_region(
+                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor
+                            )
                         except Exception as exc:
                             logging.getLogger(__name__).warning(
                                 "Failed to split data_field '%s' on page %s: %s", label, page_number, exc
@@ -155,8 +161,8 @@ class TemplateService:
 
         return {"output_dir": str(output_dir), "crops": crops}
 
-    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None) -> dict[str, Any]:
-        crop_result = self.apply_template_to_pdf(template_payload, pdf_path)
+    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None) -> dict[str, Any]:
+        crop_result = self.apply_template_to_pdf(template_payload, pdf_path, word_kernel_divisor=word_kernel_divisor)
         crops = crop_result.get("crops", [])
         output_dir = crop_result.get("output_dir", "")
         if not crops or not output_dir:
@@ -190,11 +196,14 @@ class TemplateService:
             dpi = 300
         return max(72, min(dpi, 600))
 
-    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path) -> list[dict[str, Any]]:
+    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None) -> list[dict[str, Any]]:
         """Split a data_field crop into rows and columns using image processing.
 
         Returns a list of crop dicts (same shape as apply_template_to_pdf returns) for each detected cell.
         Logs bounding boxes and counts for traceability.
+
+        word_kernel_divisor: optional integer; smaller values result in a larger horizontal kernel
+        (and therefore more aggressive merging of characters into words). Default: 15.
         """
         logger = logging.getLogger(__name__)
         try:
@@ -211,6 +220,10 @@ class TemplateService:
 
         h_img, w_img = img.shape[:2]
 
+        # Track preproc files and annotated visualization (to include in metadata)
+        preproc_files: list[str] = []
+        annotated_path_str: str | None = None
+
         # Diffuse / denoise
         blur = cv2.GaussianBlur(img, (5, 5), 0)
 
@@ -221,6 +234,58 @@ class TemplateService:
         # Morphologically close horizontally to group into rows
         horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, w_img // 40), 1))
         rows_img = cv2.morphologyEx(th, cv2.MORPH_CLOSE, horiz_kernel, iterations=1)
+
+        # If debug logging is enabled, save preprocessing images and log their paths/sizes/shapes
+        # Save these into a dedicated 'preproc' folder and prepare an 'annotated' folder for visualizations
+        if logger.isEnabledFor(logging.DEBUG):
+            base_name = f"{self._sanitize_label(label)}_p{page_number}"
+            preproc_dir = output_dir / "preproc"
+            annotated_dir = output_dir / "annotated"
+            preproc_dir.mkdir(parents=True, exist_ok=True)
+            annotated_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                blur_path = preproc_dir / f"{base_name}_blur.png"
+                th_path = preproc_dir / f"{base_name}_th.png"
+                rows_path = preproc_dir / f"{base_name}_rows.png"
+                cv2.imwrite(str(blur_path), blur)
+                cv2.imwrite(str(th_path), th)
+                cv2.imwrite(str(rows_path), rows_img)
+                # Record preproc files to include in metadata
+                preproc_files.extend([str(blur_path), str(th_path), str(rows_path)])
+                try:
+                    blur_size = blur_path.stat().st_size
+                except Exception:
+                    blur_size = None
+                try:
+                    th_size = th_path.stat().st_size
+                except Exception:
+                    th_size = None
+                try:
+                    rows_size = rows_path.stat().st_size
+                except Exception:
+                    rows_size = None
+                logger.debug(
+                    "Saved preprocessing images for '%s' page %s: blur=(path=%s,size=%s,shape=%s) th=(path=%s,size=%s,shape=%s) rows=(path=%s,size=%s,shape=%s)",
+                    label,
+                    page_number,
+                    str(blur_path),
+                    blur_size,
+                    getattr(blur, "shape", None),
+                    str(th_path),
+                    th_size,
+                    getattr(th, "shape", None),
+                    str(rows_path),
+                    rows_size,
+                    getattr(rows_img, "shape", None),
+                )
+            except Exception as exc:
+                logger.debug("Failed to save preprocessing images for '%s' page %s: %s", label, page_number, exc)
+
+            # Prepare an annotated visualization image (color) to draw rows/columns/cells on
+            try:
+                vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                vis = None
 
         contours, _ = cv2.findContours(rows_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         row_boxes = [cv2.boundingRect(cnt) for cnt in contours]
@@ -241,15 +306,62 @@ class TemplateService:
             # Crop row area from original image for column detection
             row_img = th[ry : ry + rh, rx : rx + rw]
 
-            # Detect vertical groupings for columns
-            vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, h_img // 40)))
-            cols_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, vert_kernel, iterations=1)
-            contours_c, _ = cv2.findContours(cols_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            col_boxes = [cv2.boundingRect(cnt) for cnt in contours_c]
-            col_boxes = [b for b in col_boxes if b[2] > 6 and b[3] > 6]
-            if not col_boxes:
-                # fallback: use the whole row as one column
-                col_boxes = [(0, 0, rw, rh)]
+            # First try to detect whole words by closing horizontally across the row
+            # Use a wider kernel to merge characters into word-level blobs
+            divisor = int(word_kernel_divisor) if word_kernel_divisor is not None else 15
+            # Keep a sensible minimum kernel width for very small rows
+            word_kernel_width = max(5, rw // max(1, divisor))
+            word_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (word_kernel_width, 1))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Using word kernel divisor=%s => kernel_width=%s for row width=%s", divisor, word_kernel_width, rw)
+            words_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, word_kernel, iterations=1)
+
+            # Save per-row word visualization if debugging
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    words_path = preproc_dir / f"{base_name}_row{row_idx}_words.png"
+                    cv2.imwrite(str(words_path), words_img)
+                    preproc_files.append(str(words_path))
+                    try:
+                        words_size = words_path.stat().st_size
+                    except Exception:
+                        words_size = None
+                    logger.debug("Saved words image for row %s: path=%s size=%s shape=%s kernel_width=%s", row_idx, str(words_path), words_size, getattr(words_img, "shape", None), word_kernel_width)
+                except Exception as exc:
+                    logger.debug("Failed to save words image for row %s: %s", row_idx, exc)
+
+            contours_w, _ = cv2.findContours(words_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            word_boxes = [cv2.boundingRect(cnt) for cnt in contours_w]
+            word_boxes = [b for b in word_boxes if b[2] > 6 and b[3] > 6]
+
+            if word_boxes:
+                # use detected word boxes as columns (word-level boxes)
+                col_boxes = sorted(word_boxes, key=lambda x: x[0])
+            else:
+                # fallback to vertical grouping for columns when words not detected
+                vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, h_img // 40)))
+                cols_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, vert_kernel, iterations=1)
+
+                # Save per-row column visualization if debugging
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        cols_path = preproc_dir / f"{base_name}_row{row_idx}_cols.png"
+                        cv2.imwrite(str(cols_path), cols_img)
+                        preproc_files.append(str(cols_path))
+                        try:
+                            cols_size = cols_path.stat().st_size
+                        except Exception:
+                            cols_size = None
+                        logger.debug("Saved cols image for row %s: path=%s size=%s shape=%s", row_idx, str(cols_path), cols_size, getattr(cols_img, "shape", None))
+                    except Exception as exc:
+                        logger.debug("Failed to save cols image for row %s: %s", row_idx, exc)
+
+                contours_c, _ = cv2.findContours(cols_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                col_boxes = [cv2.boundingRect(cnt) for cnt in contours_c]
+                col_boxes = [b for b in col_boxes if b[2] > 6 and b[3] > 6]
+                if not col_boxes:
+                    # fallback: use the whole row as one column
+                    col_boxes = [(0, 0, rw, rh)]
 
             # Sort columns left-to-right
             col_boxes.sort(key=lambda x: x[0])
@@ -257,6 +369,13 @@ class TemplateService:
             logger.info(
                 "Row %s for '%s' page %s: detected %s columns", row_idx, label, page_number, len(col_boxes)
             )
+
+            # If an annotated viz was prepared, draw the row rectangle
+            if logger.isEnabledFor(logging.DEBUG) and vis is not None:
+                try:
+                    cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (0, 255, 0), 1)
+                except Exception:
+                    pass
 
             for col_idx, (cx, cy, cw, ch) in enumerate(col_boxes, start=1):
                 # Absolute bbox in the crop image
@@ -281,6 +400,31 @@ class TemplateService:
                 sub_path = output_dir / sub_filename
                 cv2.imwrite(str(sub_path), cell_img)
 
+                # If annotation is enabled, draw column / cell boxes and indices
+                if logger.isEnabledFor(logging.DEBUG) and vis is not None:
+                    try:
+                        cv2.rectangle(vis, (abs_x, abs_y), (abs_x + abs_w, abs_y + abs_h), (255, 0, 0), 1)
+                        text = f"r{row_idx}c{col_idx}"
+                        cv2.putText(vis, text, (abs_x, max(0, abs_y - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1, cv2.LINE_AA)
+                    except Exception:
+                        pass
+
+                # Log saved image path and size (bytes) and pixel dimensions for traceability
+                try:
+                    file_size = sub_path.stat().st_size
+                except Exception:
+                    file_size = None
+                try:
+                    img_shape = getattr(cell_img, "shape", None)
+                except Exception:
+                    img_shape = None
+                logger.info(
+                    "Saved cell image: path=%s size=%s bytes shape=%s",
+                    str(sub_path),
+                    file_size,
+                    img_shape,
+                )
+
                 bbox = (x0, y0, x1 - x0, y1 - y0)
                 logger.info(
                     "Detected cell %s for '%s' page %s: bbox=%s (row=%s,col=%s)",
@@ -292,23 +436,60 @@ class TemplateService:
                     col_idx,
                 )
 
-                subcrops.append(
-                    {
-                        "label": label,
-                        "page": page_number,
-                        "dpi": None,
-                        "path": str(sub_path),
-                        "parent_label": label,
-                        "row": row_idx,
-                        "col": col_idx,
-                        "bbox": {
-                            "x": int(bbox[0]),
-                            "y": int(bbox[1]),
-                            "width": int(bbox[2]),
-                            "height": int(bbox[3]),
-                        },
-                    }
+                # Build subcrop dict and include preproc / annotated metadata when available
+                subcrop: dict[str, Any] = {
+                    "label": label,
+                    "page": page_number,
+                    "dpi": None,
+                    "path": str(sub_path),
+                    "parent_label": label,
+                    "row": row_idx,
+                    "col": col_idx,
+                    "bbox": {
+                        "x": int(bbox[0]),
+                        "y": int(bbox[1]),
+                        "width": int(bbox[2]),
+                        "height": int(bbox[3]),
+                    },
+                }
+
+                if preproc_files:
+                    subcrop["preproc_images"] = list(preproc_files)
+                if annotated_path_str:
+                    subcrop["annotated_image"] = annotated_path_str
+
+                subcrops.append(subcrop)
+
+        # Save annotated image showing rows/columns/cells when debug enabled
+        if logger.isEnabledFor(logging.DEBUG) and 'vis' in locals() and vis is not None:
+            try:
+                annotated_dir = output_dir / "annotated"
+                annotated_dir.mkdir(parents=True, exist_ok=True)
+                annotated_path = annotated_dir / f"{base_name}_annotated.png"
+                # Optionally annotate the divisor used as text on the image for traceability
+                if word_kernel_divisor is not None:
+                    try:
+                        text_div = f"divisor={word_kernel_divisor}"
+                        cv2.putText(vis, text_div, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                    except Exception:
+                        pass
+                cv2.imwrite(str(annotated_path), vis)
+                # expose annotated path for inclusion in metadata
+                annotated_path_str = str(annotated_path)
+                try:
+                    ann_size = annotated_path.stat().st_size
+                except Exception:
+                    ann_size = None
+                logger.debug(
+                    "Saved annotated image for '%s' page %s: path=%s size=%s shape=%s",
+                    label,
+                    page_number,
+                    str(annotated_path),
+                    ann_size,
+                    getattr(vis, "shape", None),
                 )
+            except Exception as exc:
+                logger.debug("Failed to save annotated image for '%s' page %s: %s", label, page_number, exc)
 
         logger.info("Created %s sub-crops for data_field '%s' on page %s", len(subcrops), label, page_number)
         return subcrops
