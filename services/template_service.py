@@ -162,14 +162,14 @@ class TemplateService:
 
         return {"output_dir": str(output_dir), "crops": crops}
 
-    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None, save_crops: bool = True) -> dict[str, Any]:
+    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None, save_crops: bool = True, batch_size: int = 8, num_beams: int = 1) -> dict[str, Any]:
         crop_result = self.apply_template_to_pdf(template_payload, pdf_path, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops)
         crops = crop_result.get("crops", [])
         output_dir = crop_result.get("output_dir", "")
         if not crops or not output_dir:
             return {"output_dir": output_dir, "crops": crops, "results": []}
         pipeline = OCRPipeline()
-        ocr_result = pipeline.run(crops=crops, output_dir=output_dir, excel_path=excel_path)
+        ocr_result = pipeline.run(crops=crops, output_dir=output_dir, excel_path=excel_path, batch_size=batch_size, num_beams=num_beams)
         return {
             "output_dir": output_dir,
             "crops": crops,

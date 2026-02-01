@@ -19,6 +19,7 @@ class OCRPipeline:
         logger = logging.getLogger(__name__)
 
         model, processor, device = self._require_trocr()
+        logger.info("OCR device: %s", device)
 
         results: list[dict[str, Any]] = []
 
@@ -51,7 +52,7 @@ class OCRPipeline:
             for i in range(0, len(iterable), n):
                 yield iterable[i : i + n]
 
-        with torch.inference_mode():
+        with torch.no_grad():
             for batch in _batches(crops, batch_size):
                 # Concurrently load images for this batch to reduce IO latency
                 import io
@@ -96,6 +97,7 @@ class OCRPipeline:
                         processed_cells += 1
                     continue
 
+                # Process with PyTorch model on DirectML device
                 pixel_values = processor(images=valid_imgs, return_tensors="pt", padding=True).pixel_values.to(device)
                 try:
                     generated_ids = model.generate(pixel_values, num_beams=num_beams, max_length=max_length)
@@ -114,8 +116,9 @@ class OCRPipeline:
                     result_item = {"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": text}
                     results.append(result_item)
 
-                    # Log parsed content for traceability. Large text printing to stdout is disabled to avoid slowing large runs.
+                    # Log parsed content for traceability and print OCR text to stdout.
                     logger.info("OCR parsed (trocr): label=%s page=%s path=%s", result_item["label"], result_item["page"], result_item.get("path", "<in-memory>"))
+                    print(f"OCR: label={result_item['label']} page={result_item['page']} text={text}")
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug("Parsed text for %s: %s", result_item.get("path", "<in-memory>"), text)
 
@@ -157,10 +160,21 @@ class OCRPipeline:
             ) from exc
 
         if not hasattr(self, "_trocr_model"):
-            model_name = "microsoft/trocr-large-printed"
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            model_name = "microsoft/trocr-base-printed"
 
-            # Prefer GPU if available
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # Prefer GPU if available: try DirectML first (for AMD on Windows), then CUDA, then CPU
+            try:
+                import torch_directml
+                device = torch_directml.device()
+                device_name = "DirectML (AMD GPU)"
+                logger.info("Using DirectML device for GPU acceleration")
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                device_name = str(device)
+                logger.info("Using device: %s", device_name)
 
             processor = TrOCRProcessor.from_pretrained(model_name)
 
@@ -186,6 +200,7 @@ class OCRPipeline:
             self._trocr_model = model
             self._trocr_processor = processor
             self._trocr_device = device
+            self._trocr_device_name = device_name
 
         return self._trocr_model, self._trocr_processor, self._trocr_device
 

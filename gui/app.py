@@ -87,9 +87,17 @@ class App:
         settings = ttk.Frame(container)
         settings.pack(fill=tk.X, pady=(8, 6))
         ttk.Label(settings, text="Preproc: Word kernel divisor (smaller = more merging)").pack(side=tk.LEFT, padx=(0,8))
-        self.word_kernel_divisor_var = tk.IntVar(value=15)
+        self.word_kernel_divisor_var = tk.IntVar(value=25)
         self.word_kernel_spin = ttk.Spinbox(settings, from_=5, to=40, textvariable=self.word_kernel_divisor_var, width=5)
         self.word_kernel_spin.pack(side=tk.LEFT)
+        ttk.Label(settings, text="OCR batch size").pack(side=tk.LEFT, padx=(16, 6))
+        self.ocr_batch_size_var = tk.IntVar(value=8)
+        self.ocr_batch_size_spin = ttk.Spinbox(settings, from_=1, to=32, textvariable=self.ocr_batch_size_var, width=5)
+        self.ocr_batch_size_spin.pack(side=tk.LEFT)
+        ttk.Label(settings, text="OCR beams").pack(side=tk.LEFT, padx=(12, 6))
+        self.ocr_num_beams_var = tk.IntVar(value=1)
+        self.ocr_num_beams_spin = ttk.Spinbox(settings, from_=1, to=8, textvariable=self.ocr_num_beams_var, width=5)
+        self.ocr_num_beams_spin.pack(side=tk.LEFT)
 
         # Live preview controls
         self.preview_image_path: str | None = None
@@ -379,8 +387,10 @@ class App:
         )
         excel_path = excel_save or None
         divisor = int(self.word_kernel_divisor_var.get() or 15)
+        batch_size = int(self.ocr_batch_size_var.get() or 8)
+        num_beams = int(self.ocr_num_beams_var.get() or 1)
         try:
-            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path, word_kernel_divisor=divisor)
+            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path, word_kernel_divisor=divisor, batch_size=batch_size, num_beams=num_beams)
         except RuntimeError as exc:
             messagebox.showerror("OCR Unavailable", str(exc))
             return
