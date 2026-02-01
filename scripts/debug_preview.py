@@ -22,6 +22,13 @@ from DTOCR.core.logging import configure_logging
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Debug preprocessing and annotation on a generated image")
+    parser.add_argument("--divisor", default=10, type=int, help="Optional word kernel divisor to pass in (smaller = more merging)")
+    parser.add_argument("--no-save", action="store_true", help="Do not save cell images to disk; return image bytes in metadata instead")
+    args = parser.parse_args()
+
     configure_logging(logging.DEBUG)
     # create a simple test image containing a few words
     if Image is None:
@@ -39,7 +46,7 @@ def main() -> int:
 
     service = TemplateService(template_repo=None)  # type: ignore[arg-type]
     try:
-        subcrops = service._split_data_field_region(str(img_path), "data_field_debug", 1, outdir, word_kernel_divisor=10)
+        subcrops = service._split_data_field_region(str(img_path), "data_field_debug", 1, outdir, word_kernel_divisor=args.divisor, save_crops=(not args.no_save))
     except Exception as exc:
         print("_split_data_field_region raised:", exc)
         import traceback

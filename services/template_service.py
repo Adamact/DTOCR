@@ -86,10 +86,11 @@ class TemplateService:
         self.template_repo.rename_label_option(old_clean, new_clean)
         return True
 
-    def apply_template_to_pdf(self, template_payload: dict[str, Any], pdf_path: str, word_kernel_divisor: int | None = None) -> dict[str, Any]:
+    def apply_template_to_pdf(self, template_payload: dict[str, Any], pdf_path: str, word_kernel_divisor: int | None = None, save_crops: bool = True) -> dict[str, Any]:
         """Apply template and optionally control how data_field word-kernel is computed.
 
         word_kernel_divisor: smaller values produce larger kernels (more aggressive merging).
+        save_crops: when False, returned subcrop dicts will include in-memory PNG bytes under 'image_bytes' instead of saving cell images to disk.
         """
         regions = template_payload.get("regions", [])
         if not regions:
@@ -128,7 +129,7 @@ class TemplateService:
                     if safe_label.startswith("data_field"):
                         try:
                             subcrops = self._split_data_field_region(
-                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor
+                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops
                             )
                         except Exception as exc:
                             logging.getLogger(__name__).warning(
@@ -161,8 +162,8 @@ class TemplateService:
 
         return {"output_dir": str(output_dir), "crops": crops}
 
-    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None) -> dict[str, Any]:
-        crop_result = self.apply_template_to_pdf(template_payload, pdf_path, word_kernel_divisor=word_kernel_divisor)
+    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None, save_crops: bool = True) -> dict[str, Any]:
+        crop_result = self.apply_template_to_pdf(template_payload, pdf_path, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops)
         crops = crop_result.get("crops", [])
         output_dir = crop_result.get("output_dir", "")
         if not crops or not output_dir:
@@ -196,7 +197,7 @@ class TemplateService:
             dpi = 300
         return max(72, min(dpi, 600))
 
-    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None) -> list[dict[str, Any]]:
+    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None, save_crops: bool = True) -> list[dict[str, Any]]:
         """Split a data_field crop into rows and columns using image processing.
 
         Returns a list of crop dicts (same shape as apply_template_to_pdf returns) for each detected cell.
@@ -204,6 +205,7 @@ class TemplateService:
 
         word_kernel_divisor: optional integer; smaller values result in a larger horizontal kernel
         (and therefore more aggressive merging of characters into words). Default: 15.
+        save_crops: when False, subcrop dicts include 'image_bytes' with PNG bytes and do not write cell image files to disk.
         """
         logger = logging.getLogger(__name__)
         try:
@@ -394,11 +396,39 @@ class TemplateService:
 
                 cell_img = img[y0:y1, x0:x1]
 
-                # Save sub-image
+                # Save sub-image (to disk unless save_crops=False, in which case keep PNG bytes in-memory)
                 cell_index += 1
                 sub_filename = f"{self._sanitize_label(label)}_p{page_number}_cell{cell_index}.png"
                 sub_path = output_dir / sub_filename
-                cv2.imwrite(str(sub_path), cell_img)
+                image_bytes = None
+                if save_crops:
+                    cv2.imwrite(str(sub_path), cell_img)
+                    try:
+                        file_size = sub_path.stat().st_size
+                    except Exception:
+                        file_size = None
+                    try:
+                        img_shape = getattr(cell_img, "shape", None)
+                    except Exception:
+                        img_shape = None
+                    logger.info(
+                        "Saved cell image: path=%s size=%s bytes shape=%s",
+                        str(sub_path),
+                        file_size,
+                        img_shape,
+                    )
+                else:
+                    try:
+                        ret, buf = cv2.imencode('.png', cell_img)
+                        if ret:
+                            image_bytes = buf.tobytes()
+                            logger.debug("Created in-memory cell image for '%s' page %s: size=%s shape=%s", label, page_number, len(image_bytes), getattr(cell_img, "shape", None))
+                        else:
+                            image_bytes = None
+                            logger.debug("Failed to encode in-memory cell image for '%s' page %s", label, page_number)
+                    except Exception as exc:
+                        image_bytes = None
+                        logger.debug("Exception encoding in-memory cell image for '%s' page %s: %s", label, page_number, exc)
 
                 # If annotation is enabled, draw column / cell boxes and indices
                 if logger.isEnabledFor(logging.DEBUG) and vis is not None:
@@ -409,23 +439,8 @@ class TemplateService:
                     except Exception:
                         pass
 
-                # Log saved image path and size (bytes) and pixel dimensions for traceability
-                try:
-                    file_size = sub_path.stat().st_size
-                except Exception:
-                    file_size = None
-                try:
-                    img_shape = getattr(cell_img, "shape", None)
-                except Exception:
-                    img_shape = None
-                logger.info(
-                    "Saved cell image: path=%s size=%s bytes shape=%s",
-                    str(sub_path),
-                    file_size,
-                    img_shape,
-                )
-
                 bbox = (x0, y0, x1 - x0, y1 - y0)
+
                 logger.info(
                     "Detected cell %s for '%s' page %s: bbox=%s (row=%s,col=%s)",
                     cell_index,
@@ -441,7 +456,6 @@ class TemplateService:
                     "label": label,
                     "page": page_number,
                     "dpi": None,
-                    "path": str(sub_path),
                     "parent_label": label,
                     "row": row_idx,
                     "col": col_idx,
@@ -452,6 +466,13 @@ class TemplateService:
                         "height": int(bbox[3]),
                     },
                 }
+
+                # Attach either a filesystem path (when saved) or in-memory PNG bytes
+                if save_crops:
+                    subcrop["path"] = str(sub_path)
+                else:
+                    if image_bytes:
+                        subcrop["image_bytes"] = image_bytes
 
                 if preproc_files:
                     subcrop["preproc_images"] = list(preproc_files)

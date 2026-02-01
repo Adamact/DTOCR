@@ -24,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--label", default="data_field_test", help="Label to use (used for filenames)")
     parser.add_argument("--outdir", default=None, help="Directory to write outputs (default: temp)")
     parser.add_argument("--divisor", default=None, type=int, help="Optional word kernel divisor to pass in (smaller = more merging)")
+    parser.add_argument("--no-save", action="store_true", help="Do not save cell images to disk; return image bytes in metadata instead")
     args = parser.parse_args(argv)
 
     configure_logging(logging.DEBUG)
@@ -43,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Running preprocessing on: {img_path}")
     print(f"Writing outputs to: {outdir}")
 
-    subcrops = service._split_data_field_region(str(img_path), args.label, 1, outdir, word_kernel_divisor=args.divisor)
+    subcrops = service._split_data_field_region(str(img_path), args.label, 1, outdir, word_kernel_divisor=args.divisor, save_crops=(not args.no_save))
 
     print("\nReturned subcrops metadata:")
     for i, s in enumerate(subcrops, start=1):

@@ -10,10 +10,11 @@ from PIL import Image
 
 @dataclass
 class OCRPipeline:
-    def run(self, crops: list[dict[str, Any]], output_dir: str, excel_path: str | None = None, batch_size: int = 8, num_beams: int = 1, max_length: int = 128) -> dict[str, Any]:
+    def run(self, crops: list[dict[str, Any]], output_dir: str, excel_path: str | None = None, batch_size: int = 8, num_beams: int = 1, max_length: int = 128, image_load_workers: int = 4) -> dict[str, Any]:
         import logging
         import sys
         import torch  # type: ignore
+        from concurrent.futures import ThreadPoolExecutor
 
         logger = logging.getLogger(__name__)
 
@@ -52,21 +53,40 @@ class OCRPipeline:
 
         with torch.inference_mode():
             for batch in _batches(crops, batch_size):
+                # Concurrently load images for this batch to reduce IO latency
+                import io
+
+                def _load_image_for_crop(crop):
+                    try:
+                        image_bytes = crop.get("image_bytes")
+                        image_path = crop.get("path", "")
+                        if image_bytes:
+                            try:
+                                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                                return (crop, img, "<in-memory>")
+                            except Exception as exc:  # pragma: no cover - IO error paths
+                                logger.warning("Failed to open in-memory image for OCR: %s", exc)
+                                return (crop, None, None)
+                        elif image_path:
+                            try:
+                                img = Image.open(image_path).convert("RGB")
+                                return (crop, img, image_path)
+                            except Exception as exc:  # pragma: no cover - IO error paths
+                                logger.warning("Failed to open image for OCR: %s (%s)", image_path, exc)
+                                return (crop, None, None)
+                        else:
+                            return (crop, None, None)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.warning("Unexpected error while loading image: %s", exc)
+                        return (crop, None, None)
+
                 imgs = []
                 metas = []
-                for crop in batch:
-                    image_path = crop.get("path", "")
-                    if not image_path:
-                        continue
-                    try:
-                        img = Image.open(image_path).convert("RGB")
-                    except Exception as exc:
-                        logger.warning("Failed to open image for OCR: %s (%s)", image_path, exc)
-                        imgs.append(None)
-                        metas.append((crop, None))
-                        continue
-                    imgs.append(img)
-                    metas.append((crop, image_path))
+                # Use a thread pool to load images in parallel
+                with ThreadPoolExecutor(max_workers=image_load_workers) as ex:
+                    for crop, img, meta_path in ex.map(_load_image_for_crop, batch):
+                        imgs.append(img)
+                        metas.append((crop, meta_path))
 
                 # Prepare batch tensors (filter out None images)
                 valid_imgs = [im for im in imgs if im is not None]
@@ -94,14 +114,10 @@ class OCRPipeline:
                     result_item = {"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": text}
                     results.append(result_item)
 
-                    # Log and print parsed content for traceability
-                    logger.info("OCR parsed (trocr): label=%s page=%s path=%s text=%s", result_item["label"], result_item["page"], result_item["path"], text)
-                    try:
-                        print(f"OCR parsed | label={result_item['label']} | page={result_item['page']} | path={result_item['path']}")
-                        print(text)
-                        print("---")
-                    except Exception:
-                        logger.debug("Failed to print OCR result to stdout for %s", result_item["path"]) 
+                    # Log parsed content for traceability. Large text printing to stdout is disabled to avoid slowing large runs.
+                    logger.info("OCR parsed (trocr): label=%s page=%s path=%s", result_item["label"], result_item["page"], result_item.get("path", "<in-memory>"))
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("Parsed text for %s: %s", result_item.get("path", "<in-memory>"), text)
 
                     # Update progress: cells + pages
                     processed_cells += 1
@@ -113,7 +129,6 @@ class OCRPipeline:
                     if total_work > 0:
                         _print_progress(work_done, total_work)
                         logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
-
         # Finalize progress bar
         if total_work > 0:
             _print_progress(total_work, total_work)
