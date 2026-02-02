@@ -93,7 +93,20 @@ class OCRPipeline:
                 valid_imgs = [im for im in imgs if im is not None]
                 if not valid_imgs:
                     for crop, _ in metas:
-                        results.append({"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": ""})
+                        results.append(
+                            {
+                                "label": crop.get("label", ""),
+                                "page": crop.get("page", 0),
+                                "path": crop.get("path", ""),
+                                "text": "",
+                                "grid_id": crop.get("grid_id"),
+                                "grid_label": crop.get("grid_label"),
+                                "row_index": crop.get("row_index"),
+                                "col_index": crop.get("col_index"),
+                                "column_label": crop.get("column_label"),
+                                "cell_label": crop.get("cell_label"),
+                            }
+                        )
                         processed_cells += 1
                     continue
 
@@ -113,7 +126,18 @@ class OCRPipeline:
                         text = ""
                     else:
                         text = next(text_iter, "").strip()
-                    result_item = {"label": crop.get("label", ""), "page": crop.get("page", 0), "path": crop.get("path", ""), "text": text}
+                    result_item = {
+                        "label": crop.get("label", ""),
+                        "page": crop.get("page", 0),
+                        "path": crop.get("path", ""),
+                        "text": text,
+                        "grid_id": crop.get("grid_id"),
+                        "grid_label": crop.get("grid_label"),
+                        "row_index": crop.get("row_index"),
+                        "col_index": crop.get("col_index"),
+                        "column_label": crop.get("column_label"),
+                        "cell_label": crop.get("cell_label"),
+                    }
                     results.append(result_item)
 
                     # Log parsed content for traceability and print OCR text to stdout.
@@ -220,8 +244,78 @@ class OCRPipeline:
             raise RuntimeError(
                 "Exporting OCR results to Excel requires 'pandas' and 'openpyxl' packages. Install them with: pip install pandas openpyxl"
             ) from exc
-        df = pd.DataFrame(results)
+        
         excel_p = Path(excel_path)
         excel_p.parent.mkdir(parents=True, exist_ok=True)
-        df.to_excel(excel_p, index=False, engine="openpyxl")
+
+        # Separate grid results from non-grid results
+        grid_results = [r for r in results if r.get("grid_id") is not None and r.get("row_index") is not None]
+        non_grid_results = [r for r in results if r.get("grid_id") is None]
+        
+        if not grid_results:
+            # If no grid results, just export all as a simple table
+            df = pd.DataFrame(results)
+            df.to_excel(excel_p, index=False, engine="openpyxl")
+            return excel_p
+
+        # Group results by grid_label (each grid gets its own sheet)
+        from collections import defaultdict
+        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in grid_results:
+            grid_label = str(item.get("grid_label", "Grid"))
+            groups[grid_label].append(item)
+
+        def _sheet_name(name: str) -> str:
+            cleaned = "".join(ch for ch in name if ch not in r"[]:*?/\\")
+            return cleaned[:31] or "Grid"
+
+        with pd.ExcelWriter(excel_p, engine="openpyxl") as writer:
+            # Write non-grid results if any
+            if non_grid_results:
+                df = pd.DataFrame(non_grid_results)
+                df.to_excel(writer, index=False, sheet_name="OCR_Results")
+
+            # For each grid, map directly: template row N → Excel row N, template col M → Excel col M
+            # Pages after the first continue filling rows
+            for grid_label, items in groups.items():
+                # Get all unique columns and rows
+                cols = sorted(
+                    {
+                        (int(r.get("col_index", 0)), str(r.get("column_label", f"Column {int(r.get('col_index', 0)) + 1}")))
+                        for r in items
+                    },
+                    key=lambda x: x[0],
+                )
+                col_labels = [label for _, label in cols]
+                col_map = {idx: label for idx, label in cols}
+
+                # Get all unique rows across all pages
+                rows = sorted({int(r.get("row_index", 0)) for r in items})
+                
+                # Get page numbers and their starting row in Excel
+                pages = sorted({int(r.get("page_number", 0)) for r in items})
+                page_row_map = {}  # page_number → starting_excel_row
+                current_excel_row = 0
+                for page_num in pages:
+                    page_row_map[page_num] = current_excel_row
+                    current_excel_row += len(rows)
+
+                # Build table with rows continuing across pages
+                table_rows: list[dict[str, Any]] = []
+                for page_num in pages:
+                    excel_row_offset = page_row_map[page_num]
+                    for template_row_idx in rows:
+                        row_dict = {label: "" for label in col_labels}
+                        for item in items:
+                            if int(item.get("page_number", 0)) != page_num or int(item.get("row_index", 0)) != template_row_idx:
+                                continue
+                            col_idx = int(item.get("col_index", 0))
+                            col_label = col_map.get(col_idx, f"Column {col_idx + 1}")
+                            row_dict[col_label] = item.get("text", "")
+                        table_rows.append(row_dict)
+
+                grid_df = pd.DataFrame(table_rows)
+                sheet_name = _sheet_name(grid_label)
+                grid_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
         return excel_p

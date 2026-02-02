@@ -10,6 +10,7 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from DTOCR.services.template_service import TemplateService
+from DTOCR.core.grid_detector import auto_detect_grid_structure
 
 
 @dataclass
@@ -22,9 +23,10 @@ class Region:
     y: float
     width: float
     height: float
+    grid: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.region_id,
             "page": self.page,
             "page_scope": self.page_scope,
@@ -34,10 +36,13 @@ class Region:
             "width": self.width,
             "height": self.height,
         }
+        if self.grid:
+            payload["grid"] = self.grid
+        return payload
 
 
 class TemplateEditor:
-    PAGE_SCOPES = ("first", "middle", "last", "specific")
+    PAGE_SCOPES = ("all", "first", "middle", "last", "specific")
     REGION_OUTLINE_COLOR = "#1976d2"
     REGION_SELECTED_COLOR = "#d32f2f"
     REGION_OUTLINE_WIDTH = 2
@@ -65,6 +70,7 @@ class TemplateEditor:
                 y=region.get("y", 0.0),
                 width=region.get("width", 0.0),
                 height=region.get("height", 0.0),
+                grid=region.get("grid"),
             )
             for region in template_payload.get("regions", [])
         ]
@@ -83,7 +89,18 @@ class TemplateEditor:
         self.canvas_image_id: int | None = None
         self.canvas_rect_id: int | None = None
         self.canvas_region_map: dict[str, int] = {}
+        self.canvas_col_label_map: dict[int, tuple[str, int]] = {}  # text_item_id -> (region_id, col_idx)
         self.drag_start: tuple[float, float] | None = None
+        self.inline_edit_entry: tk.Entry | None = None
+        self.inline_edit_data: tuple[str, int] | None = None  # (region_id, col_idx)
+        self.drawing_mode: str = "region"  # "region" or "grid"
+        self.grid_active_region_id: str | None = None
+        self.grid_rows_var = tk.StringVar(value="")
+        self.grid_cols_var = tk.StringVar(value="")
+        self.grid_row_height_var = tk.StringVar(value="")
+        self.grid_col_width_var = tk.StringVar(value="")
+        self.grid_col_label_var = tk.StringVar(value="")
+        self._updating_slider = False  # Prevent slider feedback loops
 
         self._build_ui()
 
@@ -100,6 +117,14 @@ class TemplateEditor:
         ttk.Button(controls, text="Load PDF", command=self._on_load_pdf).pack(side=tk.LEFT)
         ttk.Button(controls, text="Zoom In", command=lambda: self._apply_zoom(1.1)).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(controls, text="Zoom Out", command=lambda: self._apply_zoom(1 / 1.1)).pack(side=tk.LEFT, padx=4)
+        
+        ttk.Separator(controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        
+        self.create_grid_btn = ttk.Button(controls, text="✚ Create Grid", command=self._toggle_grid_mode)
+        self.create_grid_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.mode_label = ttk.Label(controls, text="Mode: Normal", foreground="#666")
+        self.mode_label.pack(side=tk.LEFT, padx=(0, 12))
+        
         self.pdf_label = ttk.Label(controls, text=self.source_pdf or "No PDF loaded")
         self.pdf_label.pack(side=tk.LEFT, padx=12)
 
@@ -136,7 +161,7 @@ class TemplateEditor:
         sidebar.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
 
         ttk.Label(sidebar, text="Regions", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
-        self.region_list = tk.Listbox(sidebar, height=20)
+        self.region_list = tk.Listbox(sidebar, height=20, exportselection=False)
         self.region_list.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
         self.region_list.bind("<<ListboxSelect>>", self._on_region_select)
 
@@ -145,6 +170,78 @@ class TemplateEditor:
 
         ttk.Button(sidebar, text="Delete Region", command=self._delete_region).pack(fill=tk.X)
         ttk.Button(sidebar, text="Save Template", command=self._save_template).pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        grid_frame = ttk.LabelFrame(sidebar, text="Grid (data_field_grid)")
+        grid_frame.pack(fill=tk.X)
+
+        self.grid_status_label = ttk.Label(grid_frame, text="Select a grid region")
+        self.grid_status_label.pack(anchor="w", padx=8, pady=(6, 4))
+
+        grid_info = ttk.Frame(grid_frame)
+        grid_info.pack(fill=tk.X, padx=8)
+        ttk.Label(grid_info, text="Rows").grid(row=0, column=0, sticky="w")
+        ttk.Label(grid_info, textvariable=self.grid_rows_var).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(grid_info, text="Cols").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(grid_info, textvariable=self.grid_cols_var).grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        ttk.Label(grid_frame, text="Rows").pack(anchor="w", padx=8, pady=(6, 0))
+        self.grid_rows_list = tk.Listbox(grid_frame, height=5, exportselection=False)
+        self.grid_rows_list.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.grid_rows_list.bind("<<ListboxSelect>>", self._on_grid_row_select)
+
+        row_edit = ttk.Frame(grid_frame)
+        row_edit.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(row_edit, text="Height:").grid(row=0, column=0, sticky="w")
+        ttk.Button(row_edit, text="-", command=lambda: self._adjust_row_height(-5), width=3).grid(row=0, column=1, padx=(6, 2))
+        ttk.Entry(row_edit, textvariable=self.grid_row_height_var, width=6, justify="center").grid(row=0, column=2)
+        ttk.Button(row_edit, text="+", command=lambda: self._adjust_row_height(5), width=3).grid(row=0, column=3, padx=(2, 0))
+        ttk.Label(row_edit, text="%").grid(row=0, column=4, sticky="w", padx=(2, 0))
+
+        self.row_height_slider = tk.Scale(
+            grid_frame, from_=2, to=80, orient=tk.HORIZONTAL,
+            variable=self.grid_row_height_var, showvalue=False,
+            command=self._on_row_slider_change
+        )
+        self.row_height_slider.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        row_buttons = ttk.Frame(grid_frame)
+        row_buttons.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(row_buttons, text="Add", command=self._add_grid_row, width=8).pack(side=tk.LEFT)
+        ttk.Button(row_buttons, text="Remove", command=self._remove_grid_row, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row_buttons, text="Equal Heights", command=self._equalize_row_heights, width=12).pack(side=tk.LEFT)
+
+        ttk.Label(grid_frame, text="Columns").pack(anchor="w", padx=8, pady=(6, 0))
+        self.grid_cols_list = tk.Listbox(grid_frame, height=5, exportselection=False)
+        self.grid_cols_list.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.grid_cols_list.bind("<<ListboxSelect>>", self._on_grid_col_select)
+
+        col_edit = ttk.Frame(grid_frame)
+        col_edit.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(col_edit, text="Label:").grid(row=0, column=0, sticky="w")
+        label_entry = ttk.Entry(col_edit, textvariable=self.grid_col_label_var, width=18)
+        label_entry.grid(row=0, column=1, columnspan=4, sticky="ew", padx=(6, 0))
+        label_entry.bind("<Return>", lambda e: self._update_selected_col())
+        label_entry.bind("<FocusOut>", lambda e: self._update_selected_col())
+        
+        ttk.Label(col_edit, text="Width:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(col_edit, text="-", command=lambda: self._adjust_col_width(-5), width=3).grid(row=1, column=1, padx=(6, 2), pady=(4, 0))
+        ttk.Entry(col_edit, textvariable=self.grid_col_width_var, width=6, justify="center").grid(row=1, column=2, pady=(4, 0))
+        ttk.Button(col_edit, text="+", command=lambda: self._adjust_col_width(5), width=3).grid(row=1, column=3, padx=(2, 0), pady=(4, 0))
+        ttk.Label(col_edit, text="%").grid(row=1, column=4, sticky="w", padx=(2, 0), pady=(4, 0))
+
+        self.col_width_slider = tk.Scale(
+            grid_frame, from_=5, to=95, orient=tk.HORIZONTAL,
+            variable=self.grid_col_width_var, showvalue=False,
+            command=self._on_col_slider_change
+        )
+        self.col_width_slider.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        col_buttons = ttk.Frame(grid_frame)
+        col_buttons.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(col_buttons, text="Add", command=self._add_grid_col, width=8).pack(side=tk.LEFT)
+        ttk.Button(col_buttons, text="Remove", command=self._remove_grid_col, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Button(col_buttons, text="Equal Widths", command=self._equalize_col_widths, width=12).pack(side=tk.LEFT)
 
     def _on_load_pdf(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -179,6 +276,7 @@ class TemplateEditor:
 
     def _render_regions(self) -> None:
         self.canvas_region_map.clear()
+        self.canvas_col_label_map.clear()
         self.region_list.delete(0, tk.END)
         current_page = self.page_index + 1
         page_count = self.doc.page_count if self.doc else 0
@@ -199,6 +297,8 @@ class TemplateEditor:
                     width=self.REGION_OUTLINE_WIDTH,
                 )
                 self.canvas_region_map[region.region_id] = rect_id
+                if self._is_grid_region(region):
+                    self._render_grid_overlay(region, x1, y1, x2, y2)
 
     def _prev_page(self) -> None:
         if not self.doc or self.page_index <= 0:
@@ -217,6 +317,14 @@ class TemplateEditor:
             return
         start_x = self.canvas.canvasx(event.x)
         start_y = self.canvas.canvasy(event.y)
+        
+        # Check if clicking on a column label for inline editing
+        clicked_items = self.canvas.find_overlapping(start_x - 2, start_y - 2, start_x + 2, start_y + 2)
+        for item_id in clicked_items:
+            if item_id in self.canvas_col_label_map:
+                self._start_inline_column_edit(item_id, start_x, start_y)
+                return
+        
         self.drag_start = (start_x, start_y)
         if self.canvas_rect_id:
             self.canvas.delete(self.canvas_rect_id)
@@ -246,11 +354,73 @@ class TemplateEditor:
             self.canvas_rect_id = None
             return
 
-        label, page_scope = self._prompt_region_metadata()
-        if not label:
-            self.canvas.delete(self.canvas_rect_id)
-            self.canvas_rect_id = None
-            return
+        # Grid mode: auto-create grid with auto-detection from image
+        if self.drawing_mode == "grid":
+            label, page_scope = self._prompt_grid_label()
+            if not label:
+                self.canvas.delete(self.canvas_rect_id)
+                self.canvas_rect_id = None
+                return
+            
+            # Create temporary crop to analyze for grid structure
+            if not self.doc:
+                self.canvas.delete(self.canvas_rect_id)
+                self.canvas_rect_id = None
+                return
+            
+            page = self.doc.load_page(self.page_index)
+            dpi = self._parse_dpi()
+            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            
+            rect = fitz.Rect(
+                x1 / self.page_scale,
+                y1 / self.page_scale,
+                x2 / self.page_scale,
+                y2 / self.page_scale,
+            )
+            
+            pix = page.get_pixmap(clip=rect, matrix=matrix)
+            import tempfile
+            temp_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
+            pix.save(temp_path)
+            
+            # Auto-detect grid structure
+            grid = auto_detect_grid_structure(temp_path, label)
+            if not grid:
+                # Fallback to default 5x3 grid if detection fails
+                messagebox.showwarning(
+                    "Grid Detection Failed",
+                    "Could not auto-detect grid structure from the image.\nUsing default 5 rows × 3 columns.",
+                )
+                grid = self._build_default_grid(5, 3)
+            
+            # Clean up temp file
+            try:
+                import os
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            
+            # Switch back to normal mode after creating grid
+            self.drawing_mode = "region"
+            self._update_mode_ui()
+        else:
+            # Normal region mode
+            label, page_scope = self._prompt_region_metadata()
+            if not label:
+                self.canvas.delete(self.canvas_rect_id)
+                self.canvas_rect_id = None
+                return
+            
+            grid: dict[str, Any] | None = None
+            # Still support creating grids via label prefix
+            if self._is_grid_label(label):
+                rows, cols = self._prompt_grid_dimensions()
+                if rows is None or cols is None:
+                    self.canvas.delete(self.canvas_rect_id)
+                    self.canvas_rect_id = None
+                    return
+                grid = self._build_default_grid(rows, cols)
 
         region = Region(
             region_id=str(uuid4()),
@@ -261,6 +431,7 @@ class TemplateEditor:
             y=y1 / self.page_scale,
             width=(x2 - x1) / self.page_scale,
             height=(y2 - y1) / self.page_scale,
+            grid=grid,
         )
         self.regions.append(region)
         self.canvas_rect_id = None
@@ -275,9 +446,13 @@ class TemplateEditor:
                 width=self.REGION_OUTLINE_WIDTH,
             )
         if not selection:
+            # Only clear grid controls if we don't have an active grid already
+            if not self.grid_active_region_id:
+                self._set_grid_controls(None)
             return
         index = selection[0]
         region = self.regions[index]
+        self._set_grid_controls(region)
         current_page = self.page_index + 1
         page_count = self.doc.page_count if self.doc else 0
         if not self._region_applies_to_page(region, current_page, page_count):
@@ -297,6 +472,7 @@ class TemplateEditor:
         index = selection[0]
         self.regions.pop(index)
         self._render_page()
+        self._set_grid_controls(None)
 
     def _save_template(self) -> None:
         payload = dict(self.template_payload)
@@ -364,6 +540,9 @@ class TemplateEditor:
             return "specific"
         if self.doc.page_count == 1:
             return "first"
+        # For multi-page documents, default to 'all' for consistent processing
+        if self.doc.page_count > 1:
+            return "all"
         if self.page_index == 0:
             return "first"
         if self.page_index == self.doc.page_count - 1:
@@ -371,11 +550,538 @@ class TemplateEditor:
         return "middle"
 
     def _region_display_text(self, region: Region) -> str:
+        grid_tag = " [grid]" if self._is_grid_region(region) else ""
         if region.page_scope == "specific":
-            return f"{region.label} (p{region.page})"
-        return f"{region.label} ({region.page_scope})"
+            return f"{region.label}{grid_tag} (p{region.page})"
+        return f"{region.label}{grid_tag} ({region.page_scope})"
+
+    def _is_grid_label(self, label: str) -> bool:
+        return label.strip().lower().startswith("data_field_grid")
+
+    def _is_grid_region(self, region: Region) -> bool:
+        return self._is_grid_label(region.label) and isinstance(region.grid, dict)
+
+    def _prompt_grid_dimensions(self) -> tuple[int | None, int | None]:
+        dialog = tk.Toplevel(self.window)
+        dialog.title("Grid Dimensions")
+        dialog.transient(self.window)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Rows").grid(row=0, column=0, padx=12, pady=(12, 6), sticky="w")
+        rows_var = tk.StringVar(value="5")
+        ttk.Spinbox(dialog, from_=1, to=50, textvariable=rows_var, width=6).grid(row=0, column=1, padx=12, pady=(12, 6), sticky="w")
+
+        ttk.Label(dialog, text="Columns").grid(row=1, column=0, padx=12, pady=(0, 12), sticky="w")
+        cols_var = tk.StringVar(value="3")
+        ttk.Spinbox(dialog, from_=1, to=20, textvariable=cols_var, width=6).grid(row=1, column=1, padx=12, pady=(0, 12), sticky="w")
+
+        result: list[tuple[int | None, int | None]] = [(None, None)]
+
+        def on_ok() -> None:
+            try:
+                rows_val = max(1, int(rows_var.get()))
+                cols_val = max(1, int(cols_var.get()))
+            except ValueError:
+                rows_val, cols_val = 5, 3
+            result[0] = (rows_val, cols_val)
+            dialog.destroy()
+
+        def on_cancel() -> None:
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="e")
+        ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="OK", command=on_ok).pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.wait_window()
+        return result[0]
+
+    def _build_default_grid(self, rows: int, cols: int) -> dict[str, Any]:
+        row_ratio = 1.0 / max(rows, 1)
+        col_ratio = 1.0 / max(cols, 1)
+        return {
+            "type": "explicit",
+            "rows": [{"height_ratio": row_ratio} for _ in range(rows)],
+            "columns": [
+                {"label": f"Column {idx + 1}", "width_ratio": col_ratio}
+                for idx in range(cols)
+            ],
+            "cell_labels": {},
+        }
+
+    def _render_grid_overlay(self, region: Region, x1: float, y1: float, x2: float, y2: float) -> None:
+        grid = region.grid or {}
+        rows = grid.get("rows", [])
+        cols = grid.get("columns", [])
+        if not rows or not cols:
+            return
+        row_ratios = self._normalize_ratios([float(r.get("height_ratio", 0.0)) for r in rows])
+        col_ratios = self._normalize_ratios([float(c.get("width_ratio", 0.0)) for c in cols])
+
+        height = y2 - y1
+        width = x2 - x1
+
+        y_cursor = y1
+        for ratio in row_ratios[:-1]:
+            y_cursor += height * ratio
+            self.canvas.create_line(x1, y_cursor, x2, y_cursor, fill="#66bb6a", width=1)
+
+        x_cursor = x1
+        for idx, ratio in enumerate(col_ratios[:-1]):
+            x_cursor += width * ratio
+            self.canvas.create_line(x_cursor, y1, x_cursor, y2, fill="#66bb6a", width=1)
+
+        # Column labels on first row (clickable for inline editing)
+        label_y = y1 + 6
+        x_cursor = x1
+        for idx, ratio in enumerate(col_ratios):
+            col_width = width * ratio
+            col = cols[idx]
+            label = str(col.get("label", f"Column {idx + 1}"))
+            text_id = self.canvas.create_text(
+                x_cursor + col_width / 2,
+                label_y,
+                text=label,
+                fill="#2e7d32",
+                font=("TkDefaultFont", 8),
+            )
+            # Track this text item for click detection
+            self.canvas_col_label_map[text_id] = (region.region_id, idx)
+            x_cursor += col_width
+
+    def _normalize_ratios(self, ratios: list[float]) -> list[float]:
+        total = sum(r for r in ratios if r > 0)
+        if total <= 0:
+            count = max(len(ratios), 1)
+            return [1.0 / count for _ in ratios]
+        return [max(r, 0.0) / total for r in ratios]
+
+    def _selected_region(self) -> Region | None:
+        selection = self.region_list.curselection()
+        if not selection:
+            return None
+        return self.regions[selection[0]]
+
+    def _set_grid_controls(self, region: Region | None) -> None:
+        if not region or not self._is_grid_label(region.label):
+            self.grid_active_region_id = None
+            self.grid_status_label.config(text="Select a grid region")
+            self.grid_rows_var.set("0")
+            self.grid_cols_var.set("0")
+            self.grid_rows_list.delete(0, tk.END)
+            self.grid_cols_list.delete(0, tk.END)
+            self.grid_row_height_var.set(1.0)  # Scale requires numeric value
+            self.grid_col_width_var.set(1.0)   # Scale requires numeric value
+            self.grid_col_label_var.set("")
+            return
+
+        if not isinstance(region.grid, dict):
+            region.grid = self._build_default_grid(rows=5, cols=3)
+        self.grid_active_region_id = region.region_id
+        self.grid_status_label.config(text=f"Grid: {region.label}")
+        self._refresh_grid_lists(region)
+
+    def _refresh_grid_lists(self, region: Region) -> None:
+        grid = region.grid or {}
+        rows = grid.get("rows", [])
+        cols = grid.get("columns", [])
+        row_ratios = self._normalize_ratios([float(r.get("height_ratio", 0.0)) for r in rows])
+        col_ratios = self._normalize_ratios([float(c.get("width_ratio", 0.0)) for c in cols])
+
+        self.grid_rows_var.set(str(len(rows)))
+        self.grid_cols_var.set(str(len(cols)))
+
+        self.grid_rows_list.delete(0, tk.END)
+        for idx, ratio in enumerate(row_ratios):
+            self.grid_rows_list.insert(tk.END, f"Row {idx + 1} - {ratio * 100:.1f}%")
+
+        self.grid_cols_list.delete(0, tk.END)
+        for idx, ratio in enumerate(col_ratios):
+            label = str(cols[idx].get("label", f"Column {idx + 1}"))
+            self.grid_cols_list.insert(tk.END, f"Col {idx + 1}: {label} - {ratio * 100:.1f}%")
+
+    def _active_grid_region(self) -> Region | None:
+        if not self.grid_active_region_id:
+            return None
+        for region in self.regions:
+            if region.region_id == self.grid_active_region_id:
+                return region
+        return None
+
+    def _on_grid_row_select(self, _: tk.Event) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_rows_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        rows = region.grid.get("rows", [])
+        if idx >= len(rows):
+            return
+        ratio = float(rows[idx].get("height_ratio", 0.0))
+        self._updating_slider = True
+        self.grid_row_height_var.set(f"{ratio * 100:.1f}")
+        self._updating_slider = False
+
+    def _on_grid_col_select(self, _: tk.Event) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_cols_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        cols = region.grid.get("columns", [])
+        if idx >= len(cols):
+            return
+        col = cols[idx]
+        self.grid_col_label_var.set(str(col.get("label", f"Column {idx + 1}")))
+        ratio = float(col.get("width_ratio", 0.0))
+        self._updating_slider = True
+        self.grid_col_width_var.set(f"{ratio * 100:.1f}")
+        self._updating_slider = False
+
+    def _update_selected_row_height(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_rows_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        try:
+            new_pct = float(self.grid_row_height_var.get())
+        except ValueError:
+            return
+        self._set_ratio(region.grid.get("rows", []), idx, new_pct / 100.0, "height_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+    
+    def _adjust_row_height(self, delta: float) -> None:
+        """Increment or decrement the selected row height by delta percentage."""
+        try:
+            current = float(self.grid_row_height_var.get())
+        except ValueError:
+            return
+        new_value = max(2.0, min(80.0, current + delta))
+        self.grid_row_height_var.set(f"{new_value:.1f}")
+        self._update_selected_row_height()
+    
+    def _on_row_slider_change(self, value: str) -> None:
+        """Handle row height slider changes."""
+        if self._updating_slider:
+            return
+        self._update_selected_row_height()
+    
+    def _equalize_row_heights(self) -> None:
+        """Set all row heights to equal values."""
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        rows = region.grid.get("rows", [])
+        if not rows:
+            return
+        equal_ratio = 1.0 / len(rows)
+        for row in rows:
+            row["height_ratio"] = equal_ratio
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _update_selected_col(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_cols_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        cols = region.grid.get("columns", [])
+        if idx >= len(cols):
+            return
+        cols[idx]["label"] = self.grid_col_label_var.get().strip() or f"Column {idx + 1}"
+        try:
+            new_pct = float(self.grid_col_width_var.get())
+        except ValueError:
+            new_pct = None
+        if new_pct is not None:
+            self._set_ratio(cols, idx, new_pct / 100.0, "width_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+    
+    def _adjust_col_width(self, delta: float) -> None:
+        """Increment or decrement the selected column width by delta percentage."""
+        try:
+            current = float(self.grid_col_width_var.get())
+        except ValueError:
+            return
+        new_value = max(5.0, min(95.0, current + delta))
+        self.grid_col_width_var.set(f"{new_value:.1f}")
+        self._update_selected_col()
+    
+    def _on_col_slider_change(self, value: str) -> None:
+        """Handle column width slider changes."""
+        if self._updating_slider:
+            return
+        self._update_selected_col()
+    
+    def _equalize_col_widths(self) -> None:
+        """Set all column widths to equal values."""
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        cols = region.grid.get("columns", [])
+        if not cols:
+            return
+        equal_ratio = 1.0 / len(cols)
+        for col in cols:
+            col["width_ratio"] = equal_ratio
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _add_grid_row(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        rows = region.grid.setdefault("rows", [])
+        rows.append({"height_ratio": 1.0})
+        self._normalize_ratio_list(rows, "height_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _remove_grid_row(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_rows_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        rows = region.grid.get("rows", [])
+        if len(rows) <= 1:
+            return
+        rows.pop(idx)
+        self._normalize_ratio_list(rows, "height_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _add_grid_col(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        cols = region.grid.setdefault("columns", [])
+        cols.append({"label": f"Column {len(cols) + 1}", "width_ratio": 1.0})
+        self._normalize_ratio_list(cols, "width_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _remove_grid_col(self) -> None:
+        region = self._active_grid_region()
+        if not region or not region.grid:
+            return
+        selection = self.grid_cols_list.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        cols = region.grid.get("columns", [])
+        if len(cols) <= 1:
+            return
+        cols.pop(idx)
+        self._normalize_ratio_list(cols, "width_ratio")
+        self._refresh_grid_lists(region)
+        self._render_page()
+
+    def _set_ratio(self, items: list[dict[str, Any]], index: int, new_ratio: float, key: str) -> None:
+        if not items or index < 0 or index >= len(items):
+            return
+        new_ratio = max(0.02, min(new_ratio, 0.98))
+        total_other = sum(float(item.get(key, 0.0)) for i, item in enumerate(items) if i != index)
+        remaining = max(0.0, 1.0 - new_ratio)
+        if total_other <= 0:
+            per = remaining / max(len(items) - 1, 1)
+            for i, item in enumerate(items):
+                item[key] = new_ratio if i == index else per
+        else:
+            for i, item in enumerate(items):
+                if i == index:
+                    item[key] = new_ratio
+                else:
+                    current = float(item.get(key, 0.0))
+                    item[key] = current * (remaining / total_other)
+
+    def _normalize_ratio_list(self, items: list[dict[str, Any]], key: str) -> None:
+        ratios = [float(item.get(key, 0.0)) for item in items]
+        normed = self._normalize_ratios(ratios)
+        for item, ratio in zip(items, normed):
+            item[key] = ratio
+
+    def _toggle_grid_mode(self) -> None:
+        """Toggle between normal region drawing and grid creation mode."""
+        if self.drawing_mode == "region":
+            self.drawing_mode = "grid"
+        else:
+            self.drawing_mode = "region"
+        self._update_mode_ui()
+    
+    def _update_mode_ui(self) -> None:
+        """Update UI to reflect current drawing mode."""
+        if self.drawing_mode == "grid":
+            self.mode_label.config(text="Mode: Create Grid", foreground="#2e7d32")
+            self.create_grid_btn.config(text="✓ Grid Mode")
+            self.canvas.config(cursor="crosshair")
+        else:
+            self.mode_label.config(text="Mode: Normal", foreground="#666")
+            self.create_grid_btn.config(text="✚ Create Grid")
+            self.canvas.config(cursor="")
+    
+    def _prompt_grid_label(self) -> tuple[str | None, str]:
+        """Prompt for grid label only (dimensions are auto-detected)."""
+        dialog = tk.Toplevel(self.window)
+        dialog.title("Create Grid Region")
+        dialog.transient(self.window)
+        dialog.grab_set()
+        
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="Select a label for this grid:", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", pady=(0, 8))
+        
+        label_var = tk.StringVar(value="data_field_grid_1")
+        label_combo = ttk.Combobox(
+            frame,
+            textvariable=label_var,
+            values=[opt for opt in self.label_options if "grid" in opt.lower()] or ["data_field_grid_1", "data_field_grid_2"],
+            width=25,
+            state="readonly",
+        )
+        label_combo.pack(fill=tk.X, pady=8)
+        
+        ttk.Label(frame, text="Page Scope:").pack(anchor="w", pady=(8, 4))
+        default_scope = self._default_page_scope()
+        scope_var = tk.StringVar(value=default_scope)
+        scope_combo = ttk.Combobox(
+            frame,
+            textvariable=scope_var,
+            values=list(self.PAGE_SCOPES),
+            width=25,
+            state="readonly",
+        )
+        scope_combo.pack(fill=tk.X, pady=(0, 8))
+        
+        info_text = ttk.Label(frame, text="Grid dimensions will be auto-detected\nfrom the selected region.", foreground="#666")
+        info_text.pack(anchor="w", pady=(8, 16))
+        
+        result: list[tuple[str | None, str]] = [(None, default_scope)]
+        
+        def on_ok() -> None:
+            label = label_var.get().strip()
+            if not label:
+                label = "data_field_grid_1"
+            result[0] = (label, scope_var.get())
+            dialog.destroy()
+        
+        def on_cancel() -> None:
+            dialog.destroy()
+        
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X, pady=(8, 0), anchor="e")
+        ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(buttons, text="Create", command=on_ok, default=tk.ACTIVE).pack(side=tk.RIGHT)
+        
+        dialog.wait_window()
+        return result[0]
+
+    def _start_inline_column_edit(self, text_id: int, canvas_x: float, canvas_y: float) -> None:
+        """Start inline editing of a column label on the canvas."""
+        if text_id not in self.canvas_col_label_map:
+            return
+        
+        region_id, col_idx = self.canvas_col_label_map[text_id]
+        region = None
+        for r in self.regions:
+            if r.region_id == region_id:
+                region = r
+                break
+        if not region or not region.grid:
+            return
+        
+        cols = region.grid.get("columns", [])
+        if col_idx >= len(cols):
+            return
+        
+        current_label = str(cols[col_idx].get("label", f"Column {col_idx + 1}"))
+        
+        # Get the text item position
+        bbox = self.canvas.bbox(text_id)
+        if not bbox:
+            return
+        
+        # Create an entry widget on the canvas
+        entry_var = tk.StringVar(value=current_label)
+        entry = tk.Entry(self.canvas, textvariable=entry_var, font=("TkDefaultFont", 8), width=15)
+        entry_window = self.canvas.create_window(
+            (bbox[0] + bbox[2]) / 2,
+            (bbox[1] + bbox[3]) / 2,
+            window=entry,
+        )
+        
+        self.inline_edit_entry = entry
+        self.inline_edit_data = (region_id, col_idx)
+        
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+        
+        def on_commit(event=None) -> None:
+            self._commit_inline_column_edit(entry_var.get())
+        
+        def on_cancel(event=None) -> None:
+            self._cancel_inline_column_edit()
+        
+        entry.bind("<Return>", on_commit)
+        entry.bind("<Escape>", on_cancel)
+        entry.bind("<FocusOut>", on_commit)
+    
+    def _commit_inline_column_edit(self, new_label: str) -> None:
+        """Save the edited column label and refresh."""
+        if not self.inline_edit_entry or not self.inline_edit_data:
+            return
+        
+        region_id, col_idx = self.inline_edit_data
+        region = None
+        for r in self.regions:
+            if r.region_id == region_id:
+                region = r
+                break
+        
+        if region and region.grid:
+            cols = region.grid.get("columns", [])
+            if col_idx < len(cols):
+                cols[col_idx]["label"] = new_label.strip() or f"Column {col_idx + 1}"
+                # Update the side panel if this region is active
+                if self.grid_active_region_id == region_id:
+                    self._refresh_grid_lists(region)
+        
+        self._cleanup_inline_edit()
+        self._render_page()
+    
+    def _cancel_inline_column_edit(self) -> None:
+        """Cancel inline editing without saving."""
+        self._cleanup_inline_edit()
+    
+    def _cleanup_inline_edit(self) -> None:
+        """Remove the inline edit entry widget."""
+        if self.inline_edit_entry:
+            try:
+                self.inline_edit_entry.destroy()
+            except Exception:
+                pass
+            self.inline_edit_entry = None
+        self.inline_edit_data = None
 
     def _region_applies_to_page(self, region: Region, page_number: int, page_count: int) -> bool:
+        if region.page_scope == "all":
+            return True
         if region.page_scope == "specific":
             return region.page == page_number
         if region.page_scope == "first":

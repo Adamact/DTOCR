@@ -5,6 +5,7 @@ from typing import Any
 import re
 import tempfile
 from pathlib import Path
+import io
 
 from DTOCR.db.repositories import TemplateRepository # type: ignore
 import fitz
@@ -27,6 +28,9 @@ class TemplateService:
         "data_field_1",
         "data_field_2",
         "data_field_3",
+        "data_field_grid_1",
+        "data_field_grid_2",
+        "data_field_grid_3",
         "vendor_name",
         "bill_to",
         "ship_to",
@@ -91,6 +95,9 @@ class TemplateService:
 
         word_kernel_divisor: smaller values produce larger kernels (more aggressive merging).
         save_crops: when False, returned subcrop dicts will include in-memory PNG bytes under 'image_bytes' instead of saving cell images to disk.
+        
+        For multi-page documents: column structure is cached from page 1 and reused for subsequent pages,
+        while row detection remains adaptive per page.
         """
         regions = template_payload.get("regions", [])
         if not regions:
@@ -101,6 +108,9 @@ class TemplateService:
         crops: list[dict[str, Any]] = []
         dpi = self._template_dpi(template_payload)
         matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+
+        # Cache for column boundaries per label (page 1 is the reference)
+        col_boundaries_cache: dict[str, list[int]] = {}
 
         try:
             page_count = doc.page_count
@@ -120,6 +130,22 @@ class TemplateService:
                     label = str(region.get("label", "unknown"))
                     safe_label = self._sanitize_label(label)
                     label_counts[safe_label] = label_counts.get(safe_label, 0) + 1
+                    # Explicit grid: override auto-detection
+                    if safe_label.startswith("data_field_grid") and isinstance(region.get("grid"), dict):
+                        subcrops = self._split_grid_region(
+                            page=page,
+                            region=region,
+                            label=label,
+                            page_number=page_number,
+                            output_dir=output_dir,
+                            matrix=matrix,
+                            dpi=dpi,
+                            save_crops=save_crops,
+                        )
+                        if subcrops:
+                            crops.extend(subcrops)
+                        continue
+
                     filename = f"{safe_label}_p{page_number}_{label_counts[safe_label]}.png"
                     output_path = output_dir / filename
                     pix = page.get_pixmap(clip=rect, matrix=matrix)
@@ -128,9 +154,17 @@ class TemplateService:
                     # If this is a data_field region, try to split into rows/columns
                     if safe_label.startswith("data_field"):
                         try:
+                            # On first page of this label, auto-detect and cache columns
+                            cached_cols = None
+                            if label_counts[safe_label] > 1 and safe_label in col_boundaries_cache:
+                                # Use cached columns from first page
+                                cached_cols = col_boundaries_cache[safe_label]
+                            
                             subcrops = self._split_data_field_region(
-                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops
+                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops,
+                                cached_col_boundaries=cached_cols, col_boundaries_cache=col_boundaries_cache
                             )
+
                         except Exception as exc:
                             logging.getLogger(__name__).warning(
                                 "Failed to split data_field '%s' on page %s: %s", label, page_number, exc
@@ -179,7 +213,15 @@ class TemplateService:
         }
 
     def _region_applies_to_page(self, region: dict[str, Any], page_number: int, page_count: int) -> bool:
-        page_scope = region.get("page_scope", "specific")
+        # Grid regions (data_field_grid_*) default to "all" pages for multi-page consistency
+        label = str(region.get("label", ""))
+        if label.startswith("data_field_grid"):
+            page_scope = region.get("page_scope", "all")
+        else:
+            page_scope = region.get("page_scope", "specific")
+        
+        if page_scope == "all":
+            return True
         if page_scope == "specific":
             return int(region.get("page", 1)) == page_number
         if page_scope == "first":
@@ -197,7 +239,205 @@ class TemplateService:
             dpi = 300
         return max(72, min(dpi, 600))
 
-    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None, save_crops: bool = True) -> list[dict[str, Any]]:
+    def _split_grid_region(
+        self,
+        page: fitz.Page,
+        region: dict[str, Any],
+        label: str,
+        page_number: int,
+        output_dir: Path,
+        matrix: fitz.Matrix,
+        dpi: int,
+        save_crops: bool = True,
+    ) -> list[dict[str, Any]]:
+        grid = region.get("grid", {})
+        rows = grid.get("rows", [])
+        cols = grid.get("columns", [])
+        if not cols:
+            return []
+
+        # Extract region as image for row detection
+        origin_x = float(region.get("x", 0.0))
+        origin_y = float(region.get("y", 0.0))
+        width = float(region.get("width", 0.0))
+        height = float(region.get("height", 0.0))
+        
+        rect = fitz.Rect(origin_x, origin_y, origin_x + width, origin_y + height)
+        pix = page.get_pixmap(clip=rect, matrix=matrix)
+        
+        # Auto-detect rows adaptively per page
+        logger = logging.getLogger(__name__)
+        logger.info("Processing grid '%s' on page %d - extracting region at (%d,%d) size %dx%d", 
+                   label, page_number, int(origin_x), int(origin_y), int(width), int(height))
+        
+        row_boxes = None
+        h_img = None
+        w_img = None
+        
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+            
+            # Convert pixmap to image for row detection
+            img_data = pix.tobytes("png")
+            img_pil = Image.open(io.BytesIO(img_data))
+            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2GRAY)
+            
+            h_img, w_img = img_cv.shape[:2]
+            
+            # Threshold to get binary image
+            _, binary = cv2.threshold(img_cv, 127, 255, cv2.THRESH_BINARY)
+            
+            # Use gap-finding algorithm to detect row boundaries
+            # Calculate darkness per row (sum of black pixels)
+            darkness = np.sum(binary == 0, axis=1)
+            
+            min_darkness = np.min(darkness)
+            max_darkness = np.max(darkness)
+            
+            if max_darkness > min_darkness:
+                # Define threshold to identify content rows
+                darkness_range = max_darkness - min_darkness
+                content_threshold = min_darkness + (darkness_range * 0.20)
+                
+                # Find content regions
+                content_regions = []
+                in_content = False
+                region_start = 0
+                
+                for y in range(h_img):
+                    has_content = darkness[y] > content_threshold
+                    
+                    if has_content and not in_content:
+                        region_start = y
+                        in_content = True
+                    elif not has_content and in_content:
+                        content_regions.append((region_start, y))
+                        in_content = False
+                
+                if in_content:
+                    content_regions.append((region_start, h_img))
+                
+                # Convert content regions to row boxes
+                if content_regions:
+                    row_boxes = [(0, start, w_img, end - start) for start, end in content_regions]
+                    logger.info("Gap-finding detected %d content regions on page %d", len(row_boxes), page_number)
+                else:
+                    row_boxes = []
+            else:
+                row_boxes = []
+            
+            if row_boxes:
+                logger.info("Auto-detected %d rows for grid '%s' on page %d (template had %d rows) - image size: %dx%d", 
+                           len(row_boxes), label, page_number, len(rows), w_img, h_img)
+                logger.debug("Row boxes for page %d: %s", page_number, row_boxes[:5])  # Log first 5 rows
+                # Use detected rows
+                detected_rows = len(row_boxes)
+            else:
+                # Fallback to template rows if detection fails
+                logger.warning("Row detection found no rows for grid '%s' page %d, using template rows", label, page_number)
+                row_boxes = None
+                detected_rows = len(rows)
+        except Exception as exc:
+            logger.warning("Could not auto-detect rows for grid '%s' page %d: %s, using template rows", 
+                          label, page_number, exc)
+            row_boxes = None
+            detected_rows = len(rows)
+
+        # Use template column structure (consistent across pages)
+        col_ratios = self._normalize_ratios([float(c.get("width_ratio", 0.0)) for c in cols])
+
+        # If rows were detected, use them; otherwise use template rows
+        if row_boxes and h_img is not None:
+            # Use detected row positions (adaptive)
+            logger.info("Using %d detected rows with template columns for page %d", len(row_boxes), page_number)
+            crops: list[dict[str, Any]] = []
+            for row_idx, (rx, ry, rw, rh) in enumerate(row_boxes):
+                for col_idx, col_ratio in enumerate(col_ratios):
+                    x_offset = sum(col_ratios[:col_idx]) * width
+                    cell_width = col_ratio * width
+
+                    # Cell position: template columns, detected rows
+                    cell_x = origin_x + x_offset
+                    cell_y = origin_y + (ry / h_img * height)  # Scale detected y to region coords
+                    cell_height = rh / h_img * height  # Scale detected height
+                    
+                    rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width, cell_y + cell_height)
+                    pix = page.get_pixmap(clip=rect, matrix=matrix)
+
+                    crop_item: dict[str, Any] = {
+                        "label": label,
+                        "page": page_number,
+                        "dpi": dpi,
+                        "grid_id": region.get("id"),
+                        "grid_label": label,
+                        "row_index": row_idx,
+                        "col_index": col_idx,
+                        "column_label": str(cols[col_idx].get("label", f"Column {col_idx + 1}")),
+                        "cell_label": grid.get("cell_labels", {}).get(f"{row_idx}:{col_idx}", ""),
+                    }
+
+                    if save_crops:
+                        filename = f"{self._sanitize_label(label)}_grid_p{page_number}_r{row_idx + 1}_c{col_idx + 1}.png"
+                        output_path = output_dir / filename
+                        pix.save(str(output_path))
+                        crop_item["path"] = str(output_path)
+                    else:
+                        crop_item["image_bytes"] = pix.tobytes("png")
+
+                    crops.append(crop_item)
+        else:
+            # Fallback: use template row structure
+            logger.info("Using template row structure (%d rows) for page %d", len(rows), page_number)
+            if not rows:
+                return []
+            row_ratios = self._normalize_ratios([float(r.get("height_ratio", 0.0)) for r in rows])
+            crops: list[dict[str, Any]] = []
+            for row_idx, row_ratio in enumerate(row_ratios):
+                y_offset = sum(row_ratios[:row_idx]) * height
+                cell_height = row_ratio * height
+                for col_idx, col_ratio in enumerate(col_ratios):
+                    x_offset = sum(col_ratios[:col_idx]) * width
+                    cell_width = col_ratio * width
+
+                    cell_x = origin_x + x_offset
+                    cell_y = origin_y + y_offset
+                    rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width, cell_y + cell_height)
+                    pix = page.get_pixmap(clip=rect, matrix=matrix)
+
+                    crop_item: dict[str, Any] = {
+                        "label": label,
+                        "page": page_number,
+                        "dpi": dpi,
+                        "grid_id": region.get("id"),
+                        "grid_label": label,
+                        "row_index": row_idx,
+                        "col_index": col_idx,
+                        "column_label": str(cols[col_idx].get("label", f"Column {col_idx + 1}")),
+                        "cell_label": grid.get("cell_labels", {}).get(f"{row_idx}:{col_idx}", ""),
+                    }
+
+                    if save_crops:
+                        filename = f"{self._sanitize_label(label)}_grid_p{page_number}_r{row_idx + 1}_c{col_idx + 1}.png"
+                        output_path = output_dir / filename
+                        pix.save(str(output_path))
+                        crop_item["path"] = str(output_path)
+                    else:
+                        crop_item["image_bytes"] = pix.tobytes("png")
+
+                    crops.append(crop_item)
+
+        return crops
+
+    def _normalize_ratios(self, ratios: list[float]) -> list[float]:
+        total = sum(r for r in ratios if r > 0)
+        if total <= 0:
+            count = max(len(ratios), 1)
+            return [1.0 / count for _ in ratios]
+        return [max(r, 0.0) / total for r in ratios]
+
+    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None, save_crops: bool = True, cached_col_boundaries: list[int] | None = None, col_boundaries_cache: dict[str, list[int]] | None = None) -> list[dict[str, Any]]:
         """Split a data_field crop into rows and columns using image processing.
 
         Returns a list of crop dicts (same shape as apply_template_to_pdf returns) for each detected cell.
@@ -206,6 +446,8 @@ class TemplateService:
         word_kernel_divisor: optional integer; smaller values result in a larger horizontal kernel
         (and therefore more aggressive merging of characters into words). Default: 15.
         save_crops: when False, subcrop dicts include 'image_bytes' with PNG bytes and do not write cell image files to disk.
+        cached_col_boundaries: if provided, use these column boundaries instead of auto-detecting columns.
+        col_boundaries_cache: dict to store extracted column boundaries; will cache columns from first page of each label.
         """
         logger = logging.getLogger(__name__)
         try:
@@ -304,73 +546,103 @@ class TemplateService:
 
         subcrops: list[dict[str, Any]] = []
         cell_index = 0
+        
+        # When using cached columns, we'll extract them from the first row's processed result
+        extracted_col_boundaries: list[int] | None = None
+        
         for row_idx, (rx, ry, rw, rh) in enumerate(row_boxes, start=1):
             # Crop row area from original image for column detection
             row_img = th[ry : ry + rh, rx : rx + rw]
 
-            # First try to detect whole words by closing horizontally across the row
-            # Use a wider kernel to merge characters into word-level blobs
-            divisor = int(word_kernel_divisor) if word_kernel_divisor is not None else 15
-            # Keep a sensible minimum kernel width for very small rows
-            word_kernel_width = max(5, rw // max(1, divisor))
-            word_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (word_kernel_width, 1))
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Using word kernel divisor=%s => kernel_width=%s for row width=%s", divisor, word_kernel_width, rw)
-            words_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, word_kernel, iterations=1)
-
-            # Save per-row word visualization if debugging
-            if logger.isEnabledFor(logging.DEBUG):
-                try:
-                    words_path = preproc_dir / f"{base_name}_row{row_idx}_words.png"
-                    cv2.imwrite(str(words_path), words_img)
-                    preproc_files.append(str(words_path))
-                    try:
-                        words_size = words_path.stat().st_size
-                    except Exception:
-                        words_size = None
-                    logger.debug("Saved words image for row %s: path=%s size=%s shape=%s kernel_width=%s", row_idx, str(words_path), words_size, getattr(words_img, "shape", None), word_kernel_width)
-                except Exception as exc:
-                    logger.debug("Failed to save words image for row %s: %s", row_idx, exc)
-
-            contours_w, _ = cv2.findContours(words_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            word_boxes = [cv2.boundingRect(cnt) for cnt in contours_w]
-            word_boxes = [b for b in word_boxes if b[2] > 6 and b[3] > 6]
-
-            if word_boxes:
-                # use detected word boxes as columns (word-level boxes)
-                col_boxes = sorted(word_boxes, key=lambda x: x[0])
+            # Determine column boundaries for this row
+            if cached_col_boundaries is not None:
+                # Use cached column boundaries from first page (row-relative coordinates)
+                col_boxes = []
+                for i in range(len(cached_col_boundaries) - 1):
+                    col_start = cached_col_boundaries[i]
+                    col_end = cached_col_boundaries[i + 1]
+                    col_width = col_end - col_start
+                    if col_width > 0 and col_start < rw:
+                        # Ensure column doesn't exceed row width
+                        actual_width = min(col_width, rw - col_start)
+                        col_boxes.append((col_start, 0, actual_width, rh))
+                if not col_boxes:
+                    col_boxes = [(0, 0, rw, rh)]
+                logger.info(
+                    "Row %s for '%s' page %s: using cached %s columns (boundaries: %s)", row_idx, label, page_number, len(col_boxes), cached_col_boundaries
+                )
             else:
-                # fallback to vertical grouping for columns when words not detected
-                vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, h_img // 40)))
-                cols_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, vert_kernel, iterations=1)
+                # Auto-detect columns (for first page of this label)
+                # First try to detect whole words by closing horizontally across the row
+                # Use a wider kernel to merge characters into word-level blobs
+                divisor = int(word_kernel_divisor) if word_kernel_divisor is not None else 15
+                # Keep a sensible minimum kernel width for very small rows
+                word_kernel_width = max(5, rw // max(1, divisor))
+                word_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (word_kernel_width, 1))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Using word kernel divisor=%s => kernel_width=%s for row width=%s", divisor, word_kernel_width, rw)
+                words_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, word_kernel, iterations=1)
 
-                # Save per-row column visualization if debugging
+                # Save per-row word visualization if debugging
                 if logger.isEnabledFor(logging.DEBUG):
                     try:
-                        cols_path = preproc_dir / f"{base_name}_row{row_idx}_cols.png"
-                        cv2.imwrite(str(cols_path), cols_img)
-                        preproc_files.append(str(cols_path))
+                        words_path = preproc_dir / f"{base_name}_row{row_idx}_words.png"
+                        cv2.imwrite(str(words_path), words_img)
+                        preproc_files.append(str(words_path))
                         try:
-                            cols_size = cols_path.stat().st_size
+                            words_size = words_path.stat().st_size
                         except Exception:
-                            cols_size = None
-                        logger.debug("Saved cols image for row %s: path=%s size=%s shape=%s", row_idx, str(cols_path), cols_size, getattr(cols_img, "shape", None))
+                            words_size = None
+                        logger.debug("Saved words image for row %s: path=%s size=%s shape=%s kernel_width=%s", row_idx, str(words_path), words_size, getattr(words_img, "shape", None), word_kernel_width)
                     except Exception as exc:
-                        logger.debug("Failed to save cols image for row %s: %s", row_idx, exc)
+                        logger.debug("Failed to save words image for row %s: %s", row_idx, exc)
 
-                contours_c, _ = cv2.findContours(cols_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                col_boxes = [cv2.boundingRect(cnt) for cnt in contours_c]
-                col_boxes = [b for b in col_boxes if b[2] > 6 and b[3] > 6]
-                if not col_boxes:
-                    # fallback: use the whole row as one column
-                    col_boxes = [(0, 0, rw, rh)]
+                contours_w, _ = cv2.findContours(words_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                word_boxes = [cv2.boundingRect(cnt) for cnt in contours_w]
+                word_boxes = [b for b in word_boxes if b[2] > 6 and b[3] > 6]
 
-            # Sort columns left-to-right
-            col_boxes.sort(key=lambda x: x[0])
+                if word_boxes:
+                    # use detected word boxes as columns (word-level boxes)
+                    col_boxes = sorted(word_boxes, key=lambda x: x[0])
+                else:
+                    # fallback to vertical grouping for columns when words not detected
+                    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(10, h_img // 40)))
+                    cols_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, vert_kernel, iterations=1)
 
-            logger.info(
-                "Row %s for '%s' page %s: detected %s columns", row_idx, label, page_number, len(col_boxes)
-            )
+                    # Save per-row column visualization if debugging
+                    if logger.isEnabledFor(logging.DEBUG):
+                        try:
+                            cols_path = preproc_dir / f"{base_name}_row{row_idx}_cols.png"
+                            cv2.imwrite(str(cols_path), cols_img)
+                            preproc_files.append(str(cols_path))
+                            try:
+                                cols_size = cols_path.stat().st_size
+                            except Exception:
+                                cols_size = None
+                            logger.debug("Saved cols image for row %s: path=%s size=%s shape=%s", row_idx, str(cols_path), cols_size, getattr(cols_img, "shape", None))
+                        except Exception as exc:
+                            logger.debug("Failed to save cols image for row %s: %s", row_idx, exc)
+
+                    contours_c, _ = cv2.findContours(cols_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    col_boxes = [cv2.boundingRect(cnt) for cnt in contours_c]
+                    col_boxes = [b for b in col_boxes if b[2] > 6 and b[3] > 6]
+                    if not col_boxes:
+                        # fallback: use the whole row as one column
+                        col_boxes = [(0, 0, rw, rh)]
+
+                # Sort columns left-to-right
+                col_boxes.sort(key=lambda x: x[0])
+                
+                # If this is the first row, extract and cache the column boundaries (row-relative x-coordinates)
+                if row_idx == 1 and cached_col_boundaries is None and col_boundaries_cache is not None:
+                    # Store row-relative boundaries: just the x offsets within the row, plus row width
+                    extracted_col_boundaries = [box[0] for box in col_boxes] + [rw]
+                    col_boundaries_cache[label] = extracted_col_boundaries
+                    logger.info("Cached %d row-relative column boundaries for '%s' from first row: %s", len(extracted_col_boundaries), label, extracted_col_boundaries)
+
+                logger.info(
+                    "Row %s for '%s' page %s: detected %s columns", row_idx, label, page_number, len(col_boxes)
+                )
 
             # If an annotated viz was prepared, draw the row rectangle
             if logger.isEnabledFor(logging.DEBUG) and vis is not None:

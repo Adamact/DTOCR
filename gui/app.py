@@ -83,18 +83,14 @@ class App:
 
         self.tree.pack(fill=tk.BOTH, expand=True)
 
-        # Small settings area for preprocessing controls
+        # Small settings area for OCR controls
         settings = ttk.Frame(container)
         settings.pack(fill=tk.X, pady=(8, 6))
-        ttk.Label(settings, text="Preproc: Word kernel divisor (smaller = more merging)").pack(side=tk.LEFT, padx=(0,8))
-        self.word_kernel_divisor_var = tk.IntVar(value=25)
-        self.word_kernel_spin = ttk.Spinbox(settings, from_=5, to=40, textvariable=self.word_kernel_divisor_var, width=5)
-        self.word_kernel_spin.pack(side=tk.LEFT)
-        ttk.Label(settings, text="OCR batch size").pack(side=tk.LEFT, padx=(16, 6))
+        ttk.Label(settings, text="OCR batch size").pack(side=tk.LEFT, padx=(0, 6))
         self.ocr_batch_size_var = tk.IntVar(value=8)
         self.ocr_batch_size_spin = ttk.Spinbox(settings, from_=1, to=32, textvariable=self.ocr_batch_size_var, width=5)
         self.ocr_batch_size_spin.pack(side=tk.LEFT)
-        ttk.Label(settings, text="OCR beams").pack(side=tk.LEFT, padx=(12, 6))
+        ttk.Label(settings, text="OCR beams").pack(side=tk.LEFT, padx=(16, 6))
         self.ocr_num_beams_var = tk.IntVar(value=1)
         self.ocr_num_beams_spin = ttk.Spinbox(settings, from_=1, to=8, textvariable=self.ocr_num_beams_var, width=5)
         self.ocr_num_beams_spin.pack(side=tk.LEFT)
@@ -120,9 +116,8 @@ class App:
         self.preview_page_spin.pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(preview_sel, text="Live Preview", variable=self.live_preview_var).pack(side=tk.LEFT, padx=6)
         ttk.Button(preview_sel, text="Preview", command=self._on_preview).pack(side=tk.LEFT, padx=6)
-        # Trace changes: auto preview when divisor changes or live preview toggled
+        # Trace changes: auto preview when live preview toggled or page changes
         try:
-            self.word_kernel_divisor_var.trace_add("write", self._on_divisor_change)
             self.live_preview_var.trace_add("write", lambda *a: self._on_preview() if self.live_preview_var.get() and self.preview_image_path else None)
             # When the selected PDF page changes, update preview if live preview is enabled
             self.preview_pdf_page_var.trace_add("write", lambda *a: self._on_preview() if self.live_preview_var.get() and self.preview_is_pdf else None)
@@ -339,7 +334,7 @@ class App:
         )
         if not pdf_path:
             return
-        divisor = int(self.word_kernel_divisor_var.get() or 15)
+        divisor = 15  # Fixed divisor for preprocessing
         result = self.template_service.apply_template_to_pdf(payload, pdf_path, word_kernel_divisor=divisor)
         crops = result.get("crops", [])
         output_dir = result.get("output_dir", "")
@@ -386,7 +381,7 @@ class App:
             filetypes=[("Excel Files", "*.xlsx")],
         )
         excel_path = excel_save or None
-        divisor = int(self.word_kernel_divisor_var.get() or 15)
+        divisor = 15  # Fixed divisor for preprocessing
         batch_size = int(self.ocr_batch_size_var.get() or 8)
         num_beams = int(self.ocr_num_beams_var.get() or 1)
         try:
@@ -531,7 +526,21 @@ class App:
             if Image is None or ImageTk is None:
                 messagebox.showinfo("Pillow missing", "Install Pillow to show previews.")
                 return
-            divisor = int(self.word_kernel_divisor_var.get() or 15)
+            
+            # Get the selected template to apply its grid structure
+            selection = self.tree.selection()
+            if not selection:
+                messagebox.showwarning("No Template Selected", "Select a template to preview first.")
+                return
+            item = self.tree.item(selection[0])
+            template_id = int(item["values"][0])
+            payload = self.template_service.load_latest_template_payload(template_id)
+            if not payload:
+                messagebox.showerror("Missing Template", "No template payload found.")
+                return
+            
+            # Use a fixed divisor for preview
+            divisor = 15
             # Create a temporary output directory for preview artifacts
             outdir = Path(tempfile.mkdtemp(prefix="dtocr_preview_"))
             serv_logger = logging.getLogger("DTOCR.services.template_service")
@@ -544,74 +553,69 @@ class App:
                 if fitz is None:
                     messagebox.showerror("PyMuPDF missing", "Install PyMuPDF (pymupdf) to enable PDF previews")
                     return
+                
                 page_num = int(self.preview_pdf_page_var.get() or 1)
                 try:
                     doc = fitz.open(self.preview_image_path)
-                    page = doc.load_page(page_num - 1)
-                    # scale up a little for clarity
-                    mat = fitz.Matrix(2.0, 2.0)
-                    pix = page.get_pixmap(matrix=mat)
-                    temp_rendered_img = outdir / f"preview_pdf_page{page_num}.png"
-                    pix.save(str(temp_rendered_img))
+                    if page_num < 1 or page_num > doc.page_count:
+                        messagebox.showerror("Invalid Page", f"Page {page_num} not found in PDF")
+                        return
+                    page = doc[page_num - 1]
+                    matrix = fitz.Matrix(2, 2)  # 2x zoom for better quality
+                    pix = page.get_pixmap(matrix=matrix)
+                    temp_rendered_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                    pix.save(temp_rendered_img.name)
+                    temp_rendered_img.close()
+                    source_path = temp_rendered_img.name
                     doc.close()
                 except Exception as exc:
-                    logging.getLogger(__name__).exception("Failed to render PDF page: %s", exc)
-                    messagebox.showerror("Render Error", f"Failed to render PDF page: {exc}")
-                    shutil.rmtree(outdir, ignore_errors=True)
+                    messagebox.showerror("PDF Rendering Error", f"Failed to render PDF page: {exc}")
                     return
-                source_path = str(temp_rendered_img)
             else:
                 source_path = self.preview_image_path
-
+            
             try:
-                subcrops = self.template_service._split_data_field_region(source_path, "preview", 1, outdir, word_kernel_divisor=divisor)
-            finally:
-                serv_logger.setLevel(prev_level)
-
-            # Look for an annotated image first, then a words preproc image, then any preproc image
-            annotated_img = outdir / "annotated"
-            img_path = None
-            if annotated_img.exists():
-                imgs = sorted(annotated_img.glob("*.png"))
-                if imgs:
-                    img_path = imgs[0]
-            if not img_path:
-                preproc_img_dir = outdir / "preproc"
-                if preproc_img_dir.exists():
-                    imgs = sorted(preproc_img_dir.glob("*words*.png")) or sorted(preproc_img_dir.glob("*.png"))
+                # Apply the template to see the grid structure overlaid
+                result = self.template_service.apply_template_to_pdf(payload, source_path if not self.preview_is_pdf else source_path, word_kernel_divisor=divisor, save_crops=True)
+                
+                # Look for an annotated image showing the grid applied
+                annotated_dir = Path(outdir) / "annotated"
+                if annotated_dir.exists():
+                    imgs = sorted(annotated_dir.glob("*.png"))
                     if imgs:
                         img_path = imgs[0]
+                    else:
+                        img_path = None
+                else:
+                    img_path = None
+                
+                if not img_path:
+                    # Fallback: show original image with template regions
+                    img_path = Path(source_path)
+            finally:
+                serv_logger.setLevel(prev_level)
+                if temp_rendered_img and hasattr(temp_rendered_img, 'name'):
+                    try:
+                        os.unlink(temp_rendered_img.name)
+                    except Exception:
+                        pass
 
-            if not img_path:
-                messagebox.showinfo("No preview image", "No annotated/preproc images were produced (no rows detected?).")
+            if not img_path or not img_path.exists():
+                messagebox.showinfo("No Preview", "Could not generate preview image.")
                 return
 
             try:
-                img = Image.open(str(img_path))
-                # Save original PIL image for zooming (we'll resize from this)
-                self.preview_pil_image = img.convert("RGBA")
-                # Set initial zoom and render
-                z = int(self.zoom_var.get() or 100)
-                self._render_preview_image(scale_percent=z)
+                self.preview_pil_image = Image.open(str(img_path))
+                self._render_preview_image(scale_percent=int(self.zoom_var.get()))
             except Exception as exc:
-                logging.getLogger(__name__).exception("Failed to load preview image: %s", exc)
                 messagebox.showerror("Preview Error", f"Failed to load preview image: {exc}")
+            finally:
+                try:
+                    shutil.rmtree(outdir, ignore_errors=True)
+                except Exception:
+                    pass
         except Exception as exc:
             logging.getLogger(__name__).exception("Preview failed: %s", exc)
-            messagebox.showerror("Preview failed", f"Preview failed: {exc}\nSee console/log for details")
-        finally:
-            # Remove temp artifacts after loading image into memory
-            try:
-                shutil.rmtree(outdir, ignore_errors=True)
-            except Exception:
-                pass
-    def _on_divisor_change(self, *args) -> None:
-        # Called whenever the divisor is changed; trigger preview if live preview is enabled
-        try:
-            if self.live_preview_var.get() and self.preview_image_path:
-                self._on_preview()
-        except Exception:
-            pass
 
     def _change_zoom(self, delta_percent: int) -> None:
         # delta_percent is added to current zoom percent
