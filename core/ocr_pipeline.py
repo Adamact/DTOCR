@@ -52,10 +52,47 @@ class OCRPipeline:
             for i in range(0, len(iterable), n):
                 yield iterable[i : i + n]
 
+        def _append_result(result_item: dict[str, Any]) -> None:
+            nonlocal processed_cells, processed_pages_seen
+            results.append(result_item)
+            page_num = int(result_item.get("page", 0))
+            processed_cells += 1
+            if page_num and page_num not in processed_pages_seen:
+                processed_pages_seen.add(page_num)
+            processed_pages = len(processed_pages_seen)
+            work_done = processed_cells + processed_pages
+            if total_work > 0:
+                _print_progress(work_done, total_work)
+                logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
+
         with torch.no_grad():
             for batch in _batches(crops, batch_size):
                 # Concurrently load images for this batch to reduce IO latency
                 import io
+
+                image_batch = []
+                for crop in batch:
+                    text = str(crop.get("text", "")).strip()
+                    has_image = bool(crop.get("image_bytes") or crop.get("path"))
+                    if text and not has_image:
+                        result_item = {
+                            "label": crop.get("label", ""),
+                            "page": crop.get("page", 0),
+                            "path": crop.get("path", ""),
+                            "text": text,
+                            "text_source": crop.get("text_source"),
+                            "structured_rows": crop.get("structured_rows"),
+                            "structured_cols": crop.get("structured_cols"),
+                            "grid_id": crop.get("grid_id"),
+                            "grid_label": crop.get("grid_label"),
+                            "row_index": crop.get("row_index"),
+                            "col_index": crop.get("col_index"),
+                            "column_label": crop.get("column_label"),
+                            "cell_label": crop.get("cell_label"),
+                        }
+                        _append_result(result_item)
+                    else:
+                        image_batch.append(crop)
 
                 def _load_image_for_crop(crop):
                     try:
@@ -85,7 +122,7 @@ class OCRPipeline:
                 metas = []
                 # Use a thread pool to load images in parallel
                 with ThreadPoolExecutor(max_workers=image_load_workers) as ex:
-                    for crop, img, meta_path in ex.map(_load_image_for_crop, batch):
+                    for crop, img, meta_path in ex.map(_load_image_for_crop, image_batch):
                         imgs.append(img)
                         metas.append((crop, meta_path))
 
@@ -93,12 +130,15 @@ class OCRPipeline:
                 valid_imgs = [im for im in imgs if im is not None]
                 if not valid_imgs:
                     for crop, _ in metas:
-                        results.append(
+                        _append_result(
                             {
                                 "label": crop.get("label", ""),
                                 "page": crop.get("page", 0),
                                 "path": crop.get("path", ""),
                                 "text": "",
+                                "text_source": crop.get("text_source"),
+                                "structured_rows": crop.get("structured_rows"),
+                                "structured_cols": crop.get("structured_cols"),
                                 "grid_id": crop.get("grid_id"),
                                 "grid_label": crop.get("grid_label"),
                                 "row_index": crop.get("row_index"),
@@ -107,7 +147,6 @@ class OCRPipeline:
                                 "cell_label": crop.get("cell_label"),
                             }
                         )
-                        processed_cells += 1
                     continue
 
                 # Process with PyTorch model on DirectML device
@@ -131,6 +170,9 @@ class OCRPipeline:
                         "page": crop.get("page", 0),
                         "path": crop.get("path", ""),
                         "text": text,
+                        "text_source": crop.get("text_source"),
+                        "structured_rows": crop.get("structured_rows"),
+                        "structured_cols": crop.get("structured_cols"),
                         "grid_id": crop.get("grid_id"),
                         "grid_label": crop.get("grid_label"),
                         "row_index": crop.get("row_index"),
@@ -138,7 +180,7 @@ class OCRPipeline:
                         "column_label": crop.get("column_label"),
                         "cell_label": crop.get("cell_label"),
                     }
-                    results.append(result_item)
+                    _append_result(result_item)
 
                     # Log parsed content for traceability and print OCR text to stdout.
                     logger.info("OCR parsed (trocr): label=%s page=%s path=%s", result_item["label"], result_item["page"], result_item.get("path", "<in-memory>"))
@@ -147,15 +189,7 @@ class OCRPipeline:
                         logger.debug("Parsed text for %s: %s", result_item.get("path", "<in-memory>"), text)
 
                     # Update progress: cells + pages
-                    processed_cells += 1
-                    page_num = int(result_item.get("page", 0))
-                    if page_num and page_num not in processed_pages_seen:
-                        processed_pages_seen.add(page_num)
-                    processed_pages = len(processed_pages_seen)
-                    work_done = processed_cells + processed_pages
-                    if total_work > 0:
-                        _print_progress(work_done, total_work)
-                        logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
+                    # progress handled in _append_result
         # Finalize progress bar
         if total_work > 0:
             _print_progress(total_work, total_work)
@@ -251,10 +285,40 @@ class OCRPipeline:
         # Separate grid results from non-grid results
         grid_results = [r for r in results if r.get("grid_id") is not None and r.get("row_index") is not None]
         non_grid_results = [r for r in results if r.get("grid_id") is None]
+        parsed_rows: list[dict[str, Any]] = []
+        carry_by_label: dict[str, dict[str, Any] | None] = {}
+        structured_items = [
+            item
+            for item in non_grid_results
+            if isinstance(item.get("structured_rows"), list)
+        ]
+        structured_items.sort(key=lambda i: (str(i.get("label", "")), int(i.get("page", 0))))
+        for item in structured_items:
+            structured_rows = item.get("structured_rows")
+            if not isinstance(structured_rows, list):
+                continue
+            label = str(item.get("label", ""))
+            if not label.startswith("data_field"):
+                continue
+            carry = carry_by_label.get(label)
+            records, carry = self._parse_structured_rows_with_carry(structured_rows, carry)
+            carry_by_label[label] = carry
+            for record in records:
+                record["label"] = label
+                record["page"] = item.get("page")
+                parsed_rows.append(record)
+        for label, carry in carry_by_label.items():
+            if carry:
+                carry["label"] = label
+                parsed_rows.append(carry)
         
-        if not grid_results:
-            # If no grid results, just export all as a simple table
-            df = pd.DataFrame(results)
+        if not grid_results and not parsed_rows:
+            # If no grid or parsed results, export non-grid results with minimal columns
+            minimal_rows = [
+                {"label": r.get("label", ""), "page": r.get("page", 0), "text": r.get("text", "")}
+                for r in non_grid_results
+            ]
+            df = pd.DataFrame(minimal_rows)
             df.to_excel(excel_p, index=False, engine="openpyxl")
             return excel_p
 
@@ -270,9 +334,22 @@ class OCRPipeline:
             return cleaned[:31] or "Grid"
 
         with pd.ExcelWriter(excel_p, engine="openpyxl") as writer:
-            # Write non-grid results if any
+            # Write structured text results (parsed via regex) if available
+            if parsed_rows:
+                df_parsed = pd.DataFrame(parsed_rows)
+                preferred = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
+                ordered = [col for col in preferred if col in df_parsed.columns]
+                remaining = [col for col in df_parsed.columns if col not in ordered]
+                df_parsed = df_parsed[ordered + remaining]
+                df_parsed.to_excel(writer, index=False, sheet_name="Parsed_Text")
+
+            # Write non-grid results with minimal columns (no meta)
             if non_grid_results:
-                df = pd.DataFrame(non_grid_results)
+                minimal_rows = [
+                    {"label": r.get("label", ""), "page": r.get("page", 0), "text": r.get("text", "")}
+                    for r in non_grid_results
+                ]
+                df = pd.DataFrame(minimal_rows)
                 df.to_excel(writer, index=False, sheet_name="OCR_Results")
 
             # For each grid, map directly: template row N → Excel row N, template col M → Excel col M
@@ -293,21 +370,16 @@ class OCRPipeline:
                 rows = sorted({int(r.get("row_index", 0)) for r in items})
                 
                 # Get page numbers and their starting row in Excel
-                pages = sorted({int(r.get("page_number", 0)) for r in items})
-                page_row_map = {}  # page_number → starting_excel_row
-                current_excel_row = 0
-                for page_num in pages:
-                    page_row_map[page_num] = current_excel_row
-                    current_excel_row += len(rows)
+                pages = sorted({int(r.get("page_number", r.get("page", 0))) for r in items if int(r.get("page_number", r.get("page", 0))) > 0})
 
                 # Build table with rows continuing across pages
                 table_rows: list[dict[str, Any]] = []
                 for page_num in pages:
-                    excel_row_offset = page_row_map[page_num]
                     for template_row_idx in rows:
-                        row_dict = {label: "" for label in col_labels}
+                        row_dict = {"page": page_num}
+                        row_dict.update({label: "" for label in col_labels})
                         for item in items:
-                            if int(item.get("page_number", 0)) != page_num or int(item.get("row_index", 0)) != template_row_idx:
+                            if int(item.get("page_number", item.get("page", 0))) != page_num or int(item.get("row_index", 0)) != template_row_idx:
                                 continue
                             col_idx = int(item.get("col_index", 0))
                             col_label = col_map.get(col_idx, f"Column {col_idx + 1}")
@@ -319,3 +391,145 @@ class OCRPipeline:
                 grid_df.to_excel(writer, index=False, sheet_name=sheet_name)
 
         return excel_p
+
+    def _parse_structured_rows(self, rows: list[list[str]]) -> list[dict[str, Any]]:
+        records, carry = self._parse_structured_rows_with_carry(rows, None)
+        if carry:
+            records.append(carry)
+        return records
+
+    def _parse_structured_rows_with_carry(
+        self, rows: list[list[str]], carry: dict[str, Any] | None
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        import re
+        import unicodedata
+
+        def _normalize_line(line: str) -> str:
+            normalized = unicodedata.normalize("NFKD", line)
+            normalized = normalized.encode("ascii", "ignore").decode("ascii")
+            return normalized.lower()
+
+        def _extract_after_key(normalized_line: str, key: str) -> str | None:
+            pattern = rf"{re.escape(key)}\s*:\s*([^;]+)"
+            match = re.search(pattern, normalized_line)
+            if not match:
+                return None
+            return match.group(1).strip()
+
+        def _extract_numbers(line: str) -> list[float]:
+            nums = re.findall(r"\d+\.\d+|\d+", line)
+            return [float(n) for n in nums]
+
+        def _extract_qty_price_amount(line: str, record: dict[str, Any]) -> None:
+            numbers = _extract_numbers(line)
+            if len(numbers) >= 3:
+                if record.get("qty") is None:
+                    record["qty"] = numbers[0]
+                if record.get("unit_price") is None:
+                    record["unit_price"] = numbers[-2]
+                if record.get("amount") is None:
+                    record["amount"] = numbers[-1]
+            normalized = _normalize_line(line)
+            unit_match = re.search(r"\b(ton|kg|m3|m2|m)\b", normalized)
+            if unit_match and not record.get("unit"):
+                record["unit"] = unit_match.group(1)
+
+        def _is_article_code(token: str) -> bool:
+            return bool(re.fullmatch(r"[A-Z]{1,3}-?\d{2,6}", token.strip()))
+
+        def _is_complete(record: dict[str, Any]) -> bool:
+            required = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
+            return all(record.get(field) not in (None, "") for field in required)
+
+        records: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = carry
+
+        for row in rows:
+            cells = [str(c).strip() for c in row]
+            if not any(cells):
+                continue
+
+            if cells[0].isdigit():
+                if current:
+                    records.append(current)
+                current = {
+                    "item_no": int(cells[0]),
+                    "description": cells[1],
+                    "qty": None,
+                    "unit": None,
+                    "unit_price": None,
+                    "amount": None,
+                    "article_code": None,
+                    "delivery_date": None,
+                    "delivery_note": None,
+                    "buyer_order_id": None,
+                    "u_stalle": None,
+                    "contact": None,
+                    "phone": None,
+                    "vagsedel": None,
+                    "bilregnr": None,
+                    "avfallsdeklaration": None,
+                }
+                _extract_qty_price_amount(" ".join(cells[1:]), current)
+                continue
+
+            if current is None:
+                continue
+
+            if cells[0] and _is_article_code(cells[0]):
+                current["article_code"] = cells[0]
+                continue
+
+            line = " ".join(cells)
+            normalized = _normalize_line(line)
+            normalized_no_quote = normalized.replace("'", "")
+
+            if "delivery date" in normalized_no_quote:
+                match = re.search(r"(\d{4}-\d{2}-\d{2})", normalized)
+                if match:
+                    current["delivery_date"] = match.group(1)
+                continue
+
+            if "delivery note" in normalized_no_quote:
+                val = _extract_after_key(normalized, "delivery note")
+                if val:
+                    current["delivery_note"] = val
+                continue
+
+            if "buyers order id" in normalized_no_quote:
+                val = _extract_after_key(normalized_no_quote, "buyers order id")
+                if val:
+                    current["buyer_order_id"] = val
+                continue
+
+            if "u-stalle" in normalized:
+                val = _extract_after_key(normalized, "u-stalle")
+                if val:
+                    parts = [p.strip() for p in val.split(";") if p.strip()]
+                    if parts:
+                        current["u_stalle"] = parts[0]
+                    if len(parts) > 1:
+                        current["contact"] = parts[1]
+                continue
+
+            phone_match = re.search(r"\b\d{6,}\b", line)
+            if phone_match and not current.get("phone"):
+                current["phone"] = phone_match.group(0)
+
+            for key, target in [
+                ("vagsedel", "vagsedel"),
+                ("bilregnr", "bilregnr"),
+                ("avfallsdeklaration", "avfallsdeklaration"),
+            ]:
+                val = _extract_after_key(normalized, key)
+                if val:
+                    current[target] = val
+
+            _extract_qty_price_amount(line, current)
+
+        if current:
+            if _is_complete(current):
+                records.append(current)
+                current = None
+
+        return records, current

@@ -3,10 +3,79 @@
 from __future__ import annotations
 
 from typing import Any
+import copy
 import logging
 
 
-def auto_detect_grid_structure(image_path: str, label: str) -> dict[str, Any] | None:
+DEFAULT_DETECTION_SETTINGS: dict[str, Any] = {
+    "row": {
+        "content_threshold": 0.20,
+        "min_row_height_pct": 1.0,
+    },
+    "col": {
+        "white_threshold": 0.001,
+        "gap_width_px": 20,
+        "min_col_width_pct": 1.0,
+        "content_threshold": 0.05,
+    },
+    "fallback": {
+        "row_kernel_divisor": 30,
+        "word_kernel_divisor": 12,
+    },
+    "data_field": {
+        "row_kernel_divisor": 40,
+        "word_kernel_divisor": 15,
+    },
+}
+
+
+def default_detection_settings() -> dict[str, Any]:
+    return copy.deepcopy(DEFAULT_DETECTION_SETTINGS)
+
+
+def merge_detection_settings(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    settings = default_detection_settings()
+    if not overrides:
+        return settings
+
+    def _merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
+        for key, val in src.items():
+            if isinstance(val, dict) and isinstance(dst.get(key), dict):
+                _merge(dst[key], val)
+            else:
+                dst[key] = val
+
+    _merge(settings, overrides)
+
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(value, high))
+
+    row = settings.get("row", {})
+    row["content_threshold"] = _clamp(float(row.get("content_threshold", 0.20)), 0.01, 0.90)
+    row["min_row_height_pct"] = _clamp(float(row.get("min_row_height_pct", 1.0)), 0.1, 25.0)
+
+    col = settings.get("col", {})
+    col["white_threshold"] = _clamp(float(col.get("white_threshold", 0.001)), 0.0001, 0.10)
+    col["gap_width_px"] = int(_clamp(float(col.get("gap_width_px", 20)), 2.0, 200.0))
+    col["min_col_width_pct"] = _clamp(float(col.get("min_col_width_pct", 1.0)), 0.1, 25.0)
+    col["content_threshold"] = _clamp(float(col.get("content_threshold", 0.05)), 0.001, 0.50)
+
+    fallback = settings.get("fallback", {})
+    fallback["row_kernel_divisor"] = int(_clamp(float(fallback.get("row_kernel_divisor", 30)), 5.0, 120.0))
+    fallback["word_kernel_divisor"] = int(_clamp(float(fallback.get("word_kernel_divisor", 12)), 5.0, 80.0))
+
+    data_field = settings.get("data_field", {})
+    data_field["row_kernel_divisor"] = int(_clamp(float(data_field.get("row_kernel_divisor", 40)), 5.0, 120.0))
+    data_field["word_kernel_divisor"] = int(_clamp(float(data_field.get("word_kernel_divisor", 15)), 5.0, 80.0))
+
+    settings["row"] = row
+    settings["col"] = col
+    settings["fallback"] = fallback
+    settings["data_field"] = data_field
+    return settings
+
+
+def auto_detect_grid_structure(image_path: str, label: str, detection_settings: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Auto-detect grid structure by finding gaps between rows and columns.
     
     Scans the image to find white/light areas that separate rows and columns,
@@ -31,17 +100,19 @@ def auto_detect_grid_structure(image_path: str, label: str) -> dict[str, Any] | 
         # Threshold to get binary image
         _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
         
+        settings = merge_detection_settings(detection_settings)
+
         # Find row boundaries by scanning for light horizontal bands
-        row_boundaries = _find_row_boundaries(binary, h_img, w_img)
+        row_boundaries = _find_row_boundaries(binary, h_img, w_img, settings)
         if not row_boundaries:
             logger.warning("Could not detect row boundaries")
             return _detect_grid_from_content(img, h_img, w_img, logger)
         
         # Find column boundaries by scanning for light vertical bands
-        col_boundaries = _find_col_boundaries(binary, h_img, w_img)
+        col_boundaries = _find_col_boundaries(binary, h_img, w_img, settings)
         if not col_boundaries:
             logger.warning("Could not detect column boundaries")
-            return _detect_grid_from_content(img, h_img, w_img, logger)
+            return _detect_grid_from_content(img, h_img, w_img, logger, settings)
         
         num_rows = len(row_boundaries) - 1
         num_cols = len(col_boundaries) - 1
@@ -50,7 +121,7 @@ def auto_detect_grid_structure(image_path: str, label: str) -> dict[str, Any] | 
         
         if num_rows < 1 or num_cols < 1:
             logger.warning("Grid detection found invalid dimensions")
-            return _detect_grid_from_content(img, h_img, w_img, logger)
+            return _detect_grid_from_content(img, h_img, w_img, logger, settings)
         
         # Calculate adaptive row heights from boundaries
         row_heights = []
@@ -95,7 +166,7 @@ def auto_detect_grid_structure(image_path: str, label: str) -> dict[str, Any] | 
         return None
 
 
-def _find_row_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
+def _find_row_boundaries(binary: Any, h_img: int, w_img: int, settings: dict[str, Any]) -> list[int]:
     """Find row boundaries ensuring padding above and below rows without data overlap.
     
     Detects content regions and places boundaries in gaps between them.
@@ -118,7 +189,9 @@ def _find_row_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     
     # Define a threshold to identify content (non-gap) rows
     darkness_range = max_darkness - min_darkness
-    content_threshold = min_darkness + (darkness_range * 0.20)  # Rows above this have content
+    row_settings = settings.get("row", {})
+    threshold_ratio = float(row_settings.get("content_threshold", 0.20))
+    content_threshold = min_darkness + (darkness_range * threshold_ratio)  # Rows above this have content
     
     # Find all content regions (continuous stretches of high darkness)
     content_regions = []
@@ -166,7 +239,8 @@ def _find_row_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     boundaries = sorted(set(boundaries))
     
     # Filter out boundaries too close together
-    min_row_height = max(3, h_img // 100)
+    min_row_height_pct = float(row_settings.get("min_row_height_pct", 1.0))
+    min_row_height = max(3, int(h_img * (min_row_height_pct / 100.0)))
     filtered = [boundaries[0]]
     for b in boundaries[1:]:
         if b - filtered[-1] >= min_row_height:
@@ -176,7 +250,7 @@ def _find_row_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     return sorted(set(filtered))
 
 
-def _find_col_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
+def _find_col_boundaries(binary: Any, h_img: int, w_img: int, settings: dict[str, Any]) -> list[int]:
     """Find column boundaries by scanning for consecutive white columns.
     
     Scans for gaps of ~45 consecutive mostly-white columns to mark boundaries.
@@ -194,11 +268,13 @@ def _find_col_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     # Normalize to percentage of image height
     darkness_pct = darkness / h_img
     
-    # A column is "white" if it has <0.1% black pixels
-    white_threshold = 0.001
+    col_settings = settings.get("col", {})
+
+    # A column is "white" if it has a very low % of black pixels
+    white_threshold = float(col_settings.get("white_threshold", 0.001))
     
     boundaries = [0]  # Start at left edge
-    gap_size_required = 20  # Need ~20 consecutive white columns to mark boundary
+    gap_size_required = int(col_settings.get("gap_width_px", 20))
     
     x = 10  # Start scanning after ~10 pixels from left
     
@@ -221,7 +297,8 @@ def _find_col_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     boundaries = sorted(set(boundaries))
     
     # Filter out boundaries too close together
-    min_col_width = max(5, w_img // 100)
+    min_col_width_pct = float(col_settings.get("min_col_width_pct", 1.0))
+    min_col_width = max(5, int(w_img * (min_col_width_pct / 100.0)))
     filtered = [boundaries[0]]
     for b in boundaries[1:]:
         if b - filtered[-1] >= min_col_width:
@@ -230,7 +307,7 @@ def _find_col_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     
     # Post-process: remove boundaries that create completely empty columns
     # A column is empty if all its pixels are white (no content)
-    content_threshold = 0.05  # Columns with >5% black pixels have content
+    content_threshold = float(col_settings.get("content_threshold", 0.05))
     
     final_boundaries = [filtered[0]]
     for i in range(1, len(filtered) - 1):
@@ -248,7 +325,7 @@ def _find_col_boundaries(binary: Any, h_img: int, w_img: int) -> list[int]:
     return sorted(set(final_boundaries))
 
 
-def _detect_grid_from_content(img: Any, h_img: int, w_img: int, logger: Any) -> dict[str, Any] | None:
+def _detect_grid_from_content(img: Any, h_img: int, w_img: int, logger: Any, settings: dict[str, Any]) -> dict[str, Any] | None:
     """Fallback: detect grid from content using morphological operations."""
     try:
         import cv2  # type: ignore
@@ -262,7 +339,9 @@ def _detect_grid_from_content(img: Any, h_img: int, w_img: int, logger: Any) -> 
     th = 255 - th
     
     # Detect rows
-    horiz_kernel_size = max(15, w_img // 30)
+    fallback_settings = settings.get("fallback", {})
+    row_kernel_divisor = int(fallback_settings.get("row_kernel_divisor", 30))
+    horiz_kernel_size = max(15, w_img // max(1, row_kernel_divisor))
     horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_kernel_size, 1))
     rows_img = cv2.morphologyEx(th, cv2.MORPH_CLOSE, horiz_kernel, iterations=2)
     
@@ -281,8 +360,8 @@ def _detect_grid_from_content(img: Any, h_img: int, w_img: int, logger: Any) -> 
     col_count = 0
     for rx, ry, rw, rh in row_boxes[:min(3, len(row_boxes))]:
         row_img = th[ry:ry + rh, rx:rx + rw]
-        divisor = 12
-        word_kernel_width = max(5, rw // max(1, divisor))
+        word_divisor = int(fallback_settings.get("word_kernel_divisor", 12))
+        word_kernel_width = max(5, rw // max(1, word_divisor))
         word_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (word_kernel_width, 1))
         words_img = cv2.morphologyEx(row_img, cv2.MORPH_CLOSE, word_kernel, iterations=1)
         

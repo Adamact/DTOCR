@@ -334,7 +334,7 @@ class App:
         )
         if not pdf_path:
             return
-        divisor = 15  # Fixed divisor for preprocessing
+        divisor = None
         result = self.template_service.apply_template_to_pdf(payload, pdf_path, word_kernel_divisor=divisor)
         crops = result.get("crops", [])
         output_dir = result.get("output_dir", "")
@@ -381,7 +381,7 @@ class App:
             filetypes=[("Excel Files", "*.xlsx")],
         )
         excel_path = excel_save or None
-        divisor = 15  # Fixed divisor for preprocessing
+        divisor = None
         batch_size = int(self.ocr_batch_size_var.get() or 8)
         num_beams = int(self.ocr_num_beams_var.get() or 1)
         try:

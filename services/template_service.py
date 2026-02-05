@@ -11,6 +11,7 @@ from DTOCR.db.repositories import TemplateRepository # type: ignore
 import fitz
 import logging
 from DTOCR.core.ocr_pipeline import OCRPipeline
+from DTOCR.core.grid_detector import merge_detection_settings
 
 
 @dataclass
@@ -113,6 +114,7 @@ class TemplateService:
         col_boundaries_cache: dict[str, list[int]] = {}
 
         try:
+            detection_settings = merge_detection_settings(template_payload.get("detection_settings"))
             page_count = doc.page_count
             label_counts: dict[str, int] = {}
             for page_index in range(page_count):
@@ -130,8 +132,21 @@ class TemplateService:
                     label = str(region.get("label", "unknown"))
                     safe_label = self._sanitize_label(label)
                     label_counts[safe_label] = label_counts.get(safe_label, 0) + 1
+                    text_payload = self._extract_text_payload(page, rect)
+                    has_text = self._is_text_meaningful(text_payload)
                     # Explicit grid: override auto-detection
                     if safe_label.startswith("data_field_grid") and isinstance(region.get("grid"), dict):
+                        if has_text:
+                            subcrops = self._split_grid_region_text(
+                                page=page,
+                                region=region,
+                                label=label,
+                                page_number=page_number,
+                                rect=rect,
+                            )
+                            if subcrops:
+                                crops.extend(subcrops)
+                                continue
                         subcrops = self._split_grid_region(
                             page=page,
                             region=region,
@@ -141,9 +156,36 @@ class TemplateService:
                             matrix=matrix,
                             dpi=dpi,
                             save_crops=save_crops,
+                            detection_settings=detection_settings,
                         )
                         if subcrops:
                             crops.extend(subcrops)
+                        continue
+
+                    if has_text and safe_label.startswith("data_field"):
+                        structured = self._structure_text_payload(text_payload)
+                        crops.append(
+                            {
+                                "label": label,
+                                "page": page_number,
+                                "dpi": dpi,
+                                "text": structured.get("text", ""),
+                                "text_source": "pdf_text",
+                                "structured_rows": structured.get("rows"),
+                                "structured_cols": structured.get("cols"),
+                            }
+                        )
+                        continue
+                    if has_text and not safe_label.startswith("data_field"):
+                        crops.append(
+                            {
+                                "label": label,
+                                "page": page_number,
+                                "dpi": dpi,
+                                "text": text_payload.get("text", ""),
+                                "text_source": "pdf_text",
+                            }
+                        )
                         continue
 
                     filename = f"{safe_label}_p{page_number}_{label_counts[safe_label]}.png"
@@ -161,8 +203,15 @@ class TemplateService:
                                 cached_cols = col_boundaries_cache[safe_label]
                             
                             subcrops = self._split_data_field_region(
-                                str(output_path), label, page_number, output_dir, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops,
-                                cached_col_boundaries=cached_cols, col_boundaries_cache=col_boundaries_cache
+                                str(output_path),
+                                label,
+                                page_number,
+                                output_dir,
+                                word_kernel_divisor=word_kernel_divisor,
+                                save_crops=save_crops,
+                                cached_col_boundaries=cached_cols,
+                                col_boundaries_cache=col_boundaries_cache,
+                                detection_settings=detection_settings,
                             )
 
                         except Exception as exc:
@@ -232,6 +281,135 @@ class TemplateService:
             return page_count > 2 and 1 < page_number < page_count
         return False
 
+    def _extract_text_payload(self, page: fitz.Page, rect: fitz.Rect) -> dict[str, Any]:
+        try:
+            text_dict = page.get_text("dict", clip=rect)
+        except Exception:
+            return {"text": "", "words": []}
+
+        words: list[dict[str, Any]] = []
+        chunks: list[str] = []
+        for block in text_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    span_text = str(span.get("text", ""))
+                    if not span_text.strip():
+                        continue
+                    bbox = span.get("bbox", [0, 0, 0, 0])
+                    words.append(
+                        {
+                            "text": span_text,
+                            "x0": float(bbox[0]) - rect.x0,
+                            "y0": float(bbox[1]) - rect.y0,
+                            "x1": float(bbox[2]) - rect.x0,
+                            "y1": float(bbox[3]) - rect.y0,
+                        }
+                    )
+                    chunks.append(span_text)
+
+        return {"text": " ".join(chunks).strip(), "words": words}
+
+    def _is_text_meaningful(self, payload: dict[str, Any]) -> bool:
+        text = str(payload.get("text", "")).strip()
+        return len(text) > 0
+
+    def _structure_text_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        words = list(payload.get("words", []))
+        if not words:
+            return {"text": payload.get("text", ""), "rows": [], "cols": []}
+
+        words.sort(key=lambda w: (w["y0"], w["x0"]))
+        heights = [max(1.0, w["y1"] - w["y0"]) for w in words]
+        avg_height = sum(heights) / max(1, len(heights))
+        line_tol = max(2.0, avg_height * 0.6)
+
+        lines: list[list[dict[str, Any]]] = []
+        for word in words:
+            placed = False
+            for line in lines:
+                if abs(word["y0"] - line[0]["y0"]) <= line_tol:
+                    line.append(word)
+                    placed = True
+                    break
+            if not placed:
+                lines.append([word])
+
+        for line in lines:
+            line.sort(key=lambda w: w["x0"])
+
+        x_centers: list[float] = []
+        for line in lines:
+            for word in line:
+                x_centers.append((word["x0"] + word["x1"]) / 2)
+        x_centers.sort()
+        if not x_centers:
+            return {"text": payload.get("text", ""), "rows": [], "cols": []}
+
+        avg_word_width = sum(max(1.0, w["x1"] - w["x0"]) for w in words) / max(1, len(words))
+        col_tol = max(8.0, avg_word_width * 1.5)
+        col_centers: list[float] = []
+        for center in x_centers:
+            if not col_centers or abs(center - col_centers[-1]) > col_tol:
+                col_centers.append(center)
+
+        rows: list[list[str]] = []
+        for line in lines:
+            row_cells = ["" for _ in col_centers]
+            for word in line:
+                center = (word["x0"] + word["x1"]) / 2
+                col_idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - center))
+                if row_cells[col_idx]:
+                    row_cells[col_idx] = f"{row_cells[col_idx]} {word['text']}"
+                else:
+                    row_cells[col_idx] = word["text"]
+            rows.append(row_cells)
+
+        return {"text": payload.get("text", ""), "rows": rows, "cols": col_centers}
+
+    def _split_grid_region_text(
+        self,
+        page: fitz.Page,
+        region: dict[str, Any],
+        label: str,
+        page_number: int,
+        rect: fitz.Rect,
+    ) -> list[dict[str, Any]]:
+        grid = region.get("grid", {})
+        rows = grid.get("rows", [])
+        cols = grid.get("columns", [])
+        if not rows or not cols:
+            return []
+
+        row_ratios = self._normalize_ratios([float(r.get("height_ratio", 0.0)) for r in rows])
+        col_ratios = self._normalize_ratios([float(c.get("width_ratio", 0.0)) for c in cols])
+
+        crops: list[dict[str, Any]] = []
+        y_cursor = rect.y0
+        for row_idx, row_ratio in enumerate(row_ratios):
+            row_height = rect.height * row_ratio
+            x_cursor = rect.x0
+            for col_idx, col_ratio in enumerate(col_ratios):
+                col_width = rect.width * col_ratio
+                cell_rect = fitz.Rect(x_cursor, y_cursor, x_cursor + col_width, y_cursor + row_height)
+                payload = self._extract_text_payload(page, cell_rect)
+                crops.append(
+                    {
+                        "label": label,
+                        "page": page_number,
+                        "text": payload.get("text", ""),
+                        "text_source": "pdf_text",
+                        "grid_id": region.get("id"),
+                        "grid_label": label,
+                        "row_index": row_idx,
+                        "col_index": col_idx,
+                        "column_label": str(cols[col_idx].get("label", f"Column {col_idx + 1}")),
+                        "cell_label": grid.get("cell_labels", {}).get(f"{row_idx}:{col_idx}", ""),
+                    }
+                )
+                x_cursor += col_width
+            y_cursor += row_height
+        return crops
+
     def _template_dpi(self, template_payload: dict[str, Any]) -> int:
         try:
             dpi = int(template_payload.get("dpi", 300))
@@ -249,6 +427,7 @@ class TemplateService:
         matrix: fitz.Matrix,
         dpi: int,
         save_crops: bool = True,
+        detection_settings: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         grid = region.get("grid", {})
         rows = grid.get("rows", [])
@@ -296,10 +475,14 @@ class TemplateService:
             min_darkness = np.min(darkness)
             max_darkness = np.max(darkness)
             
+            settings = merge_detection_settings(detection_settings)
+            row_settings = settings.get("row", {})
+
             if max_darkness > min_darkness:
                 # Define threshold to identify content rows
                 darkness_range = max_darkness - min_darkness
-                content_threshold = min_darkness + (darkness_range * 0.20)
+                threshold_ratio = float(row_settings.get("content_threshold", 0.20))
+                content_threshold = min_darkness + (darkness_range * threshold_ratio)
                 
                 # Find content regions
                 content_regions = []
@@ -322,6 +505,9 @@ class TemplateService:
                 # Convert content regions to row boxes
                 if content_regions:
                     row_boxes = [(0, start, w_img, end - start) for start, end in content_regions]
+                    min_row_height_pct = float(row_settings.get("min_row_height_pct", 1.0))
+                    min_row_height = max(3, int(h_img * (min_row_height_pct / 100.0)))
+                    row_boxes = [b for b in row_boxes if b[3] >= min_row_height]
                     logger.info("Gap-finding detected %d content regions on page %d", len(row_boxes), page_number)
                 else:
                     row_boxes = []
@@ -437,7 +623,7 @@ class TemplateService:
             return [1.0 / count for _ in ratios]
         return [max(r, 0.0) / total for r in ratios]
 
-    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None, save_crops: bool = True, cached_col_boundaries: list[int] | None = None, col_boundaries_cache: dict[str, list[int]] | None = None) -> list[dict[str, Any]]:
+    def _split_data_field_region(self, image_path: str, label: str, page_number: int, output_dir: Path, word_kernel_divisor: int | None = None, save_crops: bool = True, cached_col_boundaries: list[int] | None = None, col_boundaries_cache: dict[str, list[int]] | None = None, detection_settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Split a data_field crop into rows and columns using image processing.
 
         Returns a list of crop dicts (same shape as apply_template_to_pdf returns) for each detected cell.
@@ -475,8 +661,13 @@ class TemplateService:
         _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         th = 255 - th
 
+        settings = merge_detection_settings(detection_settings)
+        row_settings = settings.get("row", {})
+        data_settings = settings.get("data_field", {})
+
         # Morphologically close horizontally to group into rows
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, w_img // 40), 1))
+        row_kernel_divisor = int(data_settings.get("row_kernel_divisor", 40))
+        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, w_img // max(1, row_kernel_divisor)), 1))
         rows_img = cv2.morphologyEx(th, cv2.MORPH_CLOSE, horiz_kernel, iterations=1)
 
         # If debug logging is enabled, save preprocessing images and log their paths/sizes/shapes
@@ -534,7 +725,9 @@ class TemplateService:
         contours, _ = cv2.findContours(rows_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         row_boxes = [cv2.boundingRect(cnt) for cnt in contours]
         # Filter tiny boxes
-        row_boxes = [b for b in row_boxes if b[2] > 10 and b[3] > 6]
+        min_row_height_pct = float(row_settings.get("min_row_height_pct", 1.0))
+        min_row_height = max(6, int(h_img * (min_row_height_pct / 100.0)))
+        row_boxes = [b for b in row_boxes if b[2] > 10 and b[3] > min_row_height]
         if not row_boxes:
             logger.info("No rows detected for data_field '%s' on page %s", label, page_number)
             return []
@@ -575,7 +768,10 @@ class TemplateService:
                 # Auto-detect columns (for first page of this label)
                 # First try to detect whole words by closing horizontally across the row
                 # Use a wider kernel to merge characters into word-level blobs
-                divisor = int(word_kernel_divisor) if word_kernel_divisor is not None else 15
+                if word_kernel_divisor is not None:
+                    divisor = int(word_kernel_divisor)
+                else:
+                    divisor = int(data_settings.get("word_kernel_divisor", 15))
                 # Keep a sensible minimum kernel width for very small rows
                 word_kernel_width = max(5, rw // max(1, divisor))
                 word_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (word_kernel_width, 1))
