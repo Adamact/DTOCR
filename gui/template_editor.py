@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-import fitz
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox, ttk
 
 from DTOCR.services.template_service import TemplateService
 from DTOCR.core.grid_detector import auto_detect_grid_structure, default_detection_settings, merge_detection_settings
+from DTOCR.core.pdf_renderer import PdfDocument, PdfRect, scale_from_dpi
 
 
 @dataclass
@@ -91,7 +91,7 @@ class TemplateEditor:
         self.window.title(f"Template Editor: {template_payload.get('name', '')}")
         self.window.geometry("1100x720")
 
-        self.doc: fitz.Document | None = None
+        self.doc: PdfDocument | None = None
         self.page_index = 0
         self.page_scale = 1.0
         self.zoom = 1.0
@@ -406,14 +406,14 @@ class TemplateEditor:
         try:
             page = self.doc.load_page(page_index)
             dpi = self._parse_dpi()
-            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-            rect = fitz.Rect(
+            scale = scale_from_dpi(dpi)
+            rect = PdfRect(
                 float(region.x),
                 float(region.y),
                 float(region.x + region.width),
                 float(region.y + region.height),
             )
-            pix = page.get_pixmap(clip=rect, matrix=matrix)
+            pix = page.render_pixmap(scale=scale, clip=rect)
             import tempfile
             temp_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
             pix.save(temp_path)
@@ -465,7 +465,7 @@ class TemplateEditor:
         return self.page_index
 
     def _load_pdf(self, file_path: str) -> None:
-        self.doc = fitz.open(file_path)
+        self.doc = PdfDocument(file_path)
         self.source_pdf = file_path
         self.page_index = 0
         self._render_page()
@@ -474,8 +474,7 @@ class TemplateEditor:
         if not self.doc:
             return
         page = self.doc.load_page(self.page_index)
-        matrix = fitz.Matrix(self.zoom, self.zoom)
-        pix = page.get_pixmap(matrix=matrix)
+        pix = page.render_pixmap(scale=self.zoom)
         image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         self.page_image = ImageTk.PhotoImage(image)
         self.page_scale = pix.width / page.rect.width
@@ -581,16 +580,16 @@ class TemplateEditor:
             
             page = self.doc.load_page(self.page_index)
             dpi = self._parse_dpi()
-            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            scale = scale_from_dpi(dpi)
             
-            rect = fitz.Rect(
+            rect = PdfRect(
                 x1 / self.page_scale,
                 y1 / self.page_scale,
                 x2 / self.page_scale,
                 y2 / self.page_scale,
             )
             
-            pix = page.get_pixmap(clip=rect, matrix=matrix)
+            pix = page.render_pixmap(scale=scale, clip=rect)
             import tempfile
             temp_path = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
             pix.save(temp_path)

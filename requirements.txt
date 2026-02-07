@@ -16,7 +16,7 @@ openpyxl==3.1.5
 packaging==26.0
 pandas==2.3.3
 pillow==12.1.0
-PyMuPDF==1.26.7
+pypdfium2==4.30.0
 pytesseract==0.3.13
 python-dateutil==2.9.0.post0
 pytz==2025.2

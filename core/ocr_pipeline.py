@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import re
 from typing import Any
 
 from PIL import Image
+
+from DTOCR.core import text_parsers
 
 
 @dataclass
@@ -287,21 +290,42 @@ class OCRPipeline:
         non_grid_results = [r for r in results if r.get("grid_id") is None]
         parsed_rows: list[dict[str, Any]] = []
         carry_by_label: dict[str, dict[str, Any] | None] = {}
+        def _text_to_rows(text: str) -> list[list[str]]:
+            rows: list[list[str]] = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                parts = re.split(r"\s{2,}|\t+", stripped)
+                cells = [p.strip() for p in parts if p.strip()]
+                if cells:
+                    rows.append(cells)
+            return rows
+
         structured_items = [
             item
             for item in non_grid_results
-            if isinstance(item.get("structured_rows"), list)
+            if isinstance(item.get("structured_rows"), list) or isinstance(item.get("text"), str)
         ]
         structured_items.sort(key=lambda i: (str(i.get("label", "")), int(i.get("page", 0))))
+        parser_type = text_parsers.detect_parser_type(non_grid_results)
         for item in structured_items:
             structured_rows = item.get("structured_rows")
-            if not isinstance(structured_rows, list):
-                continue
+            if not isinstance(structured_rows, list) or not structured_rows:
+                text_value = item.get("text")
+                if not isinstance(text_value, str) or not text_value.strip():
+                    continue
+                structured_rows = _text_to_rows(text_value)
+                if not structured_rows:
+                    continue
             label = str(item.get("label", ""))
             if not label.startswith("data_field"):
                 continue
             carry = carry_by_label.get(label)
-            records, carry = self._parse_structured_rows_with_carry(structured_rows, carry)
+            if parser_type == "layout-b":
+                records, carry = text_parsers.parse_structured_rows_layout_b_with_carry(structured_rows, carry)
+            else:
+                records, carry = text_parsers.parse_structured_rows_with_carry(structured_rows, carry)
             carry_by_label[label] = carry
             for record in records:
                 record["label"] = label
@@ -311,6 +335,28 @@ class OCRPipeline:
             if carry:
                 carry["label"] = label
                 parsed_rows.append(carry)
+
+        def _has_value(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, bool):
+                return value is True
+            return str(value).strip() != ""
+
+        def _keep_row(row: dict[str, Any]) -> bool:
+            bilnr = row.get("bilnr")
+            levdag = row.get("levdag")
+            return _has_value(bilnr) and _has_value(levdag)
+
+        if parsed_rows:
+            if parser_type == "layout-b":
+                parsed_rows = [row for row in parsed_rows if _keep_row(row)]
+            else:
+                parsed_rows = [
+                    row
+                    for row in parsed_rows
+                    if _has_value(row.get("bilregnr")) and _has_value(row.get("delivery_date"))
+                ]
         
         if not grid_results and not parsed_rows:
             # If no grid or parsed results, export non-grid results with minimal columns
@@ -337,11 +383,27 @@ class OCRPipeline:
             # Write structured text results (parsed via regex) if available
             if parsed_rows:
                 df_parsed = pd.DataFrame(parsed_rows)
-                preferred = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
+                if parser_type == "layout-b":
+                    preferred = [
+                        "foljesedel",
+                        "levdag",
+                        "bilnr",
+                        "produktnamn",
+                        "enhet",
+                        "kvantitet",
+                        "a_pris",
+                        "belopp_sek",
+                        "takt_miljoavgift",
+                        "vintertillagg",
+                    ]
+                    sheet_name = "Parsed_Text_LayoutB"
+                else:
+                    preferred = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
+                    sheet_name = "Parsed_Text"
                 ordered = [col for col in preferred if col in df_parsed.columns]
                 remaining = [col for col in df_parsed.columns if col not in ordered]
                 df_parsed = df_parsed[ordered + remaining]
-                df_parsed.to_excel(writer, index=False, sheet_name="Parsed_Text")
+                df_parsed.to_excel(writer, index=False, sheet_name=sheet_name)
 
             # Write non-grid results with minimal columns (no meta)
             if non_grid_results:
@@ -392,144 +454,3 @@ class OCRPipeline:
 
         return excel_p
 
-    def _parse_structured_rows(self, rows: list[list[str]]) -> list[dict[str, Any]]:
-        records, carry = self._parse_structured_rows_with_carry(rows, None)
-        if carry:
-            records.append(carry)
-        return records
-
-    def _parse_structured_rows_with_carry(
-        self, rows: list[list[str]], carry: dict[str, Any] | None
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        import re
-        import unicodedata
-
-        def _normalize_line(line: str) -> str:
-            normalized = unicodedata.normalize("NFKD", line)
-            normalized = normalized.encode("ascii", "ignore").decode("ascii")
-            return normalized.lower()
-
-        def _extract_after_key(normalized_line: str, key: str) -> str | None:
-            pattern = rf"{re.escape(key)}\s*:\s*([^;]+)"
-            match = re.search(pattern, normalized_line)
-            if not match:
-                return None
-            return match.group(1).strip()
-
-        def _extract_numbers(line: str) -> list[float]:
-            nums = re.findall(r"\d+\.\d+|\d+", line)
-            return [float(n) for n in nums]
-
-        def _extract_qty_price_amount(line: str, record: dict[str, Any]) -> None:
-            numbers = _extract_numbers(line)
-            if len(numbers) >= 3:
-                if record.get("qty") is None:
-                    record["qty"] = numbers[0]
-                if record.get("unit_price") is None:
-                    record["unit_price"] = numbers[-2]
-                if record.get("amount") is None:
-                    record["amount"] = numbers[-1]
-            normalized = _normalize_line(line)
-            unit_match = re.search(r"\b(ton|kg|m3|m2|m)\b", normalized)
-            if unit_match and not record.get("unit"):
-                record["unit"] = unit_match.group(1)
-
-        def _is_article_code(token: str) -> bool:
-            return bool(re.fullmatch(r"[A-Z]{1,3}-?\d{2,6}", token.strip()))
-
-        def _is_complete(record: dict[str, Any]) -> bool:
-            required = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
-            return all(record.get(field) not in (None, "") for field in required)
-
-        records: list[dict[str, Any]] = []
-        current: dict[str, Any] | None = carry
-
-        for row in rows:
-            cells = [str(c).strip() for c in row]
-            if not any(cells):
-                continue
-
-            if cells[0].isdigit():
-                if current:
-                    records.append(current)
-                current = {
-                    "item_no": int(cells[0]),
-                    "description": cells[1],
-                    "qty": None,
-                    "unit": None,
-                    "unit_price": None,
-                    "amount": None,
-                    "article_code": None,
-                    "delivery_date": None,
-                    "delivery_note": None,
-                    "buyer_order_id": None,
-                    "u_stalle": None,
-                    "contact": None,
-                    "phone": None,
-                    "vagsedel": None,
-                    "bilregnr": None,
-                    "avfallsdeklaration": None,
-                }
-                _extract_qty_price_amount(" ".join(cells[1:]), current)
-                continue
-
-            if current is None:
-                continue
-
-            if cells[0] and _is_article_code(cells[0]):
-                current["article_code"] = cells[0]
-                continue
-
-            line = " ".join(cells)
-            normalized = _normalize_line(line)
-            normalized_no_quote = normalized.replace("'", "")
-
-            if "delivery date" in normalized_no_quote:
-                match = re.search(r"(\d{4}-\d{2}-\d{2})", normalized)
-                if match:
-                    current["delivery_date"] = match.group(1)
-                continue
-
-            if "delivery note" in normalized_no_quote:
-                val = _extract_after_key(normalized, "delivery note")
-                if val:
-                    current["delivery_note"] = val
-                continue
-
-            if "buyers order id" in normalized_no_quote:
-                val = _extract_after_key(normalized_no_quote, "buyers order id")
-                if val:
-                    current["buyer_order_id"] = val
-                continue
-
-            if "u-stalle" in normalized:
-                val = _extract_after_key(normalized, "u-stalle")
-                if val:
-                    parts = [p.strip() for p in val.split(";") if p.strip()]
-                    if parts:
-                        current["u_stalle"] = parts[0]
-                    if len(parts) > 1:
-                        current["contact"] = parts[1]
-                continue
-
-            phone_match = re.search(r"\b\d{6,}\b", line)
-            if phone_match and not current.get("phone"):
-                current["phone"] = phone_match.group(0)
-
-            for key, target in [
-                ("vagsedel", "vagsedel"),
-                ("bilregnr", "bilregnr"),
-                ("avfallsdeklaration", "avfallsdeklaration"),
-            ]:
-                val = _extract_after_key(normalized, key)
-                if val:
-                    current[target] = val
-
-            _extract_qty_price_amount(line, current)
-
-        if current:
-            if _is_complete(current):
-                records.append(current)
-                current = None
-
-        return records, current

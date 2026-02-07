@@ -13,11 +13,8 @@ except Exception:
     Image = None
     ImageTk = None
 
-# PyMuPDF (fitz) is optional and used to render PDF pages for preview
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    fitz = None
+# pypdfium2 is optional and used to render PDF pages for preview
+from DTOCR.core.pdf_renderer import PdfDocument
 
 import glob
 import os
@@ -475,11 +472,8 @@ class App:
             p = Path(path)
             # PDF selected: enable page selector and read page count
             if p.suffix.lower() == ".pdf":
-                if fitz is None:
-                    messagebox.showerror("PyMuPDF missing", "Install PyMuPDF (pymupdf) to enable PDF previews")
-                    return
                 try:
-                    doc = fitz.open(path)
+                    doc = PdfDocument(path)
                     page_count = doc.page_count
                     doc.close()
                 except Exception as exc:
@@ -550,19 +544,14 @@ class App:
             # If previewing a PDF, render the selected page into a temporary image first
             temp_rendered_img = None
             if self.preview_is_pdf:
-                if fitz is None:
-                    messagebox.showerror("PyMuPDF missing", "Install PyMuPDF (pymupdf) to enable PDF previews")
-                    return
-                
                 page_num = int(self.preview_pdf_page_var.get() or 1)
                 try:
-                    doc = fitz.open(self.preview_image_path)
+                    doc = PdfDocument(self.preview_image_path)
                     if page_num < 1 or page_num > doc.page_count:
                         messagebox.showerror("Invalid Page", f"Page {page_num} not found in PDF")
                         return
-                    page = doc[page_num - 1]
-                    matrix = fitz.Matrix(2, 2)  # 2x zoom for better quality
-                    pix = page.get_pixmap(matrix=matrix)
+                    page = doc.load_page(page_num - 1)
+                    pix = page.render_pixmap(scale=2.0)  # 2x zoom for better quality
                     temp_rendered_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                     pix.save(temp_rendered_img.name)
                     temp_rendered_img.close()
