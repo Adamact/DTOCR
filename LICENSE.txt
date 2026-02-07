@@ -1,0 +1,14 @@
+DTOCR – Privat Licens
+
+Copyright (c) 2026 Adam Älgamo. Alla rättigheter förbehållna.
+
+Detta är privatägd mjukvara. All användning, kopiering, distribution, modifiering, visning eller körning är förbjuden utan uttryckligt skriftligt tillstånd från ägaren.
+
+Mjukvaran får endast användas av tredje part om den har sålts eller licensierats direkt av ägaren (Adam Älgamo) och ett skriftligt licensavtal finns. Utan sådant avtal är all användning förbjuden.
+
+Otillåten användning kan leda till civil- och straffrättsliga påföljder.
+
+Ingen garanti. Mjukvaran tillhandahålls "i befintligt skick" utan några uttryckliga eller underförstådda garantier, inklusive men inte begränsat till garantier om säljbarhet eller lämplighet för ett visst ändamål. Ägaren ansvarar inte för några skador som uppstår genom användning av mjukvaran.
+
+Kontakt för licensiering: Adam Älgamo
+noreply@users.noreply.github.com
