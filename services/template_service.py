@@ -8,7 +8,7 @@ from pathlib import Path
 import io
 
 from DTOCR.db.repositories import TemplateRepository # type: ignore
-import fitz
+from DTOCR.core.pdf_renderer import PdfDocument, PdfPage, PdfRect, scale_from_dpi
 import logging
 from DTOCR.core.ocr_pipeline import OCRPipeline
 from DTOCR.core.grid_detector import merge_detection_settings
@@ -105,15 +105,18 @@ class TemplateService:
             return {"output_dir": "", "crops": []}
 
         output_dir = Path(tempfile.mkdtemp(prefix="dtocr_crops_"))
-        doc = fitz.open(pdf_path)
+        doc = PdfDocument(pdf_path)
         crops: list[dict[str, Any]] = []
         dpi = self._template_dpi(template_payload)
-        matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        scale = scale_from_dpi(dpi)
 
         # Cache for column boundaries per label (page 1 is the reference)
         col_boundaries_cache: dict[str, list[int]] = {}
 
         try:
+            text_mode = self._template_text_mode(template_payload)
+            allow_text = text_mode in ("auto", "text_only")
+            allow_ocr = text_mode in ("auto", "ocr_only")
             detection_settings = merge_detection_settings(template_payload.get("detection_settings"))
             page_count = doc.page_count
             label_counts: dict[str, int] = {}
@@ -123,7 +126,7 @@ class TemplateService:
                 for region in regions:
                     if not self._region_applies_to_page(region, page_number, page_count):
                         continue
-                    rect = fitz.Rect(
+                    rect = PdfRect(
                         float(region.get("x", 0.0)),
                         float(region.get("y", 0.0)),
                         float(region.get("x", 0.0)) + float(region.get("width", 0.0)),
@@ -132,11 +135,15 @@ class TemplateService:
                     label = str(region.get("label", "unknown"))
                     safe_label = self._sanitize_label(label)
                     label_counts[safe_label] = label_counts.get(safe_label, 0) + 1
-                    text_payload = self._extract_text_payload(page, rect)
-                    has_text = self._is_text_meaningful(text_payload)
+                    if allow_text:
+                        text_payload = self._extract_text_payload(page, rect)
+                        has_text = self._is_text_meaningful(text_payload)
+                    else:
+                        text_payload = {"text": "", "words": []}
+                        has_text = False
                     # Explicit grid: override auto-detection
                     if safe_label.startswith("data_field_grid") and isinstance(region.get("grid"), dict):
-                        if has_text:
+                        if allow_text and has_text:
                             subcrops = self._split_grid_region_text(
                                 page=page,
                                 region=region,
@@ -147,22 +154,23 @@ class TemplateService:
                             if subcrops:
                                 crops.extend(subcrops)
                                 continue
-                        subcrops = self._split_grid_region(
-                            page=page,
-                            region=region,
-                            label=label,
-                            page_number=page_number,
-                            output_dir=output_dir,
-                            matrix=matrix,
-                            dpi=dpi,
-                            save_crops=save_crops,
-                            detection_settings=detection_settings,
-                        )
-                        if subcrops:
-                            crops.extend(subcrops)
+                        if allow_ocr:
+                            subcrops = self._split_grid_region(
+                                page=page,
+                                region=region,
+                                label=label,
+                                page_number=page_number,
+                                output_dir=output_dir,
+                                scale=scale,
+                                dpi=dpi,
+                                save_crops=save_crops,
+                                detection_settings=detection_settings,
+                            )
+                            if subcrops:
+                                crops.extend(subcrops)
                         continue
 
-                    if has_text and safe_label.startswith("data_field"):
+                    if allow_text and has_text and safe_label.startswith("data_field"):
                         structured = self._structure_text_payload(text_payload)
                         crops.append(
                             {
@@ -176,7 +184,7 @@ class TemplateService:
                             }
                         )
                         continue
-                    if has_text and not safe_label.startswith("data_field"):
+                    if allow_text and has_text and not safe_label.startswith("data_field"):
                         crops.append(
                             {
                                 "label": label,
@@ -188,9 +196,12 @@ class TemplateService:
                         )
                         continue
 
+                    if not allow_ocr:
+                        continue
+
                     filename = f"{safe_label}_p{page_number}_{label_counts[safe_label]}.png"
                     output_path = output_dir / filename
-                    pix = page.get_pixmap(clip=rect, matrix=matrix)
+                    pix = page.render_pixmap(scale=scale, clip=rect)
                     pix.save(str(output_path))
 
                     # If this is a data_field region, try to split into rows/columns
@@ -281,33 +292,8 @@ class TemplateService:
             return page_count > 2 and 1 < page_number < page_count
         return False
 
-    def _extract_text_payload(self, page: fitz.Page, rect: fitz.Rect) -> dict[str, Any]:
-        try:
-            text_dict = page.get_text("dict", clip=rect)
-        except Exception:
-            return {"text": "", "words": []}
-
-        words: list[dict[str, Any]] = []
-        chunks: list[str] = []
-        for block in text_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    span_text = str(span.get("text", ""))
-                    if not span_text.strip():
-                        continue
-                    bbox = span.get("bbox", [0, 0, 0, 0])
-                    words.append(
-                        {
-                            "text": span_text,
-                            "x0": float(bbox[0]) - rect.x0,
-                            "y0": float(bbox[1]) - rect.y0,
-                            "x1": float(bbox[2]) - rect.x0,
-                            "y1": float(bbox[3]) - rect.y0,
-                        }
-                    )
-                    chunks.append(span_text)
-
-        return {"text": " ".join(chunks).strip(), "words": words}
+    def _extract_text_payload(self, page: PdfPage, rect: PdfRect) -> dict[str, Any]:
+        return page.extract_text_payload(rect)
 
     def _is_text_meaningful(self, payload: dict[str, Any]) -> bool:
         text = str(payload.get("text", "")).strip()
@@ -368,11 +354,11 @@ class TemplateService:
 
     def _split_grid_region_text(
         self,
-        page: fitz.Page,
+        page: PdfPage,
         region: dict[str, Any],
         label: str,
         page_number: int,
-        rect: fitz.Rect,
+        rect: PdfRect,
     ) -> list[dict[str, Any]]:
         grid = region.get("grid", {})
         rows = grid.get("rows", [])
@@ -390,7 +376,7 @@ class TemplateService:
             x_cursor = rect.x0
             for col_idx, col_ratio in enumerate(col_ratios):
                 col_width = rect.width * col_ratio
-                cell_rect = fitz.Rect(x_cursor, y_cursor, x_cursor + col_width, y_cursor + row_height)
+                cell_rect = PdfRect(x_cursor, y_cursor, x_cursor + col_width, y_cursor + row_height)
                 payload = self._extract_text_payload(page, cell_rect)
                 crops.append(
                     {
@@ -417,14 +403,20 @@ class TemplateService:
             dpi = 300
         return max(72, min(dpi, 600))
 
+    def _template_text_mode(self, template_payload: dict[str, Any]) -> str:
+        mode = str(template_payload.get("text_mode", "auto")).strip().lower()
+        if mode not in {"auto", "ocr_only", "text_only"}:
+            return "auto"
+        return mode
+
     def _split_grid_region(
         self,
-        page: fitz.Page,
+        page: PdfPage,
         region: dict[str, Any],
         label: str,
         page_number: int,
         output_dir: Path,
-        matrix: fitz.Matrix,
+        scale: float,
         dpi: int,
         save_crops: bool = True,
         detection_settings: dict[str, Any] | None = None,
@@ -441,8 +433,10 @@ class TemplateService:
         width = float(region.get("width", 0.0))
         height = float(region.get("height", 0.0))
         
-        rect = fitz.Rect(origin_x, origin_y, origin_x + width, origin_y + height)
-        pix = page.get_pixmap(clip=rect, matrix=matrix)
+        rect = PdfRect(origin_x, origin_y, origin_x + width, origin_y + height)
+        pix = page.render_pixmap(scale=scale, clip=rect)
+        region_image = pix.image
+        img_w, img_h = region_image.size
         
         # Auto-detect rows adaptively per page
         logger = logging.getLogger(__name__)
@@ -456,12 +450,9 @@ class TemplateService:
         try:
             import cv2
             import numpy as np
-            from PIL import Image
             
             # Convert pixmap to image for row detection
-            img_data = pix.tobytes("png")
-            img_pil = Image.open(io.BytesIO(img_data))
-            img_cv = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2GRAY)
+            img_cv = cv2.cvtColor(np.array(region_image), cv2.COLOR_RGB2GRAY)
             
             h_img, w_img = img_cv.shape[:2]
             
@@ -530,6 +521,8 @@ class TemplateService:
                           label, page_number, exc)
             row_boxes = None
             detected_rows = len(rows)
+            h_img = img_h
+            w_img = img_w
 
         # Use template column structure (consistent across pages)
         col_ratios = self._normalize_ratios([float(c.get("width_ratio", 0.0)) for c in cols])
@@ -541,16 +534,15 @@ class TemplateService:
             crops: list[dict[str, Any]] = []
             for row_idx, (rx, ry, rw, rh) in enumerate(row_boxes):
                 for col_idx, col_ratio in enumerate(col_ratios):
-                    x_offset = sum(col_ratios[:col_idx]) * width
-                    cell_width = col_ratio * width
-
-                    # Cell position: template columns, detected rows
-                    cell_x = origin_x + x_offset
-                    cell_y = origin_y + (ry / h_img * height)  # Scale detected y to region coords
-                    cell_height = rh / h_img * height  # Scale detected height
-                    
-                    rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width, cell_y + cell_height)
-                    pix = page.get_pixmap(clip=rect, matrix=matrix)
+                    x_offset_px = sum(col_ratios[:col_idx]) * w_img
+                    cell_width_px = col_ratio * w_img
+                    left = int(max(0, round(x_offset_px)))
+                    top = int(max(0, round(ry)))
+                    right = int(min(w_img, round(x_offset_px + cell_width_px)))
+                    bottom = int(min(h_img, round(ry + rh)))
+                    if right <= left or bottom <= top:
+                        continue
+                    cell_image = region_image.crop((left, top, right, bottom))
 
                     crop_item: dict[str, Any] = {
                         "label": label,
@@ -567,10 +559,12 @@ class TemplateService:
                     if save_crops:
                         filename = f"{self._sanitize_label(label)}_grid_p{page_number}_r{row_idx + 1}_c{col_idx + 1}.png"
                         output_path = output_dir / filename
-                        pix.save(str(output_path))
+                        cell_image.save(str(output_path))
                         crop_item["path"] = str(output_path)
                     else:
-                        crop_item["image_bytes"] = pix.tobytes("png")
+                        buffer = io.BytesIO()
+                        cell_image.save(buffer, format="PNG")
+                        crop_item["image_bytes"] = buffer.getvalue()
 
                     crops.append(crop_item)
         else:
@@ -581,16 +575,18 @@ class TemplateService:
             row_ratios = self._normalize_ratios([float(r.get("height_ratio", 0.0)) for r in rows])
             crops: list[dict[str, Any]] = []
             for row_idx, row_ratio in enumerate(row_ratios):
-                y_offset = sum(row_ratios[:row_idx]) * height
-                cell_height = row_ratio * height
+                y_offset_px = sum(row_ratios[:row_idx]) * img_h
+                cell_height_px = row_ratio * img_h
                 for col_idx, col_ratio in enumerate(col_ratios):
-                    x_offset = sum(col_ratios[:col_idx]) * width
-                    cell_width = col_ratio * width
-
-                    cell_x = origin_x + x_offset
-                    cell_y = origin_y + y_offset
-                    rect = fitz.Rect(cell_x, cell_y, cell_x + cell_width, cell_y + cell_height)
-                    pix = page.get_pixmap(clip=rect, matrix=matrix)
+                    x_offset_px = sum(col_ratios[:col_idx]) * img_w
+                    cell_width_px = col_ratio * img_w
+                    left = int(max(0, round(x_offset_px)))
+                    top = int(max(0, round(y_offset_px)))
+                    right = int(min(img_w, round(x_offset_px + cell_width_px)))
+                    bottom = int(min(img_h, round(y_offset_px + cell_height_px)))
+                    if right <= left or bottom <= top:
+                        continue
+                    cell_image = region_image.crop((left, top, right, bottom))
 
                     crop_item: dict[str, Any] = {
                         "label": label,
@@ -607,10 +603,12 @@ class TemplateService:
                     if save_crops:
                         filename = f"{self._sanitize_label(label)}_grid_p{page_number}_r{row_idx + 1}_c{col_idx + 1}.png"
                         output_path = output_dir / filename
-                        pix.save(str(output_path))
+                        cell_image.save(str(output_path))
                         crop_item["path"] = str(output_path)
                     else:
-                        crop_item["image_bytes"] = pix.tobytes("png")
+                        buffer = io.BytesIO()
+                        cell_image.save(buffer, format="PNG")
+                        crop_item["image_bytes"] = buffer.getvalue()
 
                     crops.append(crop_item)
 

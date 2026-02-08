@@ -226,16 +226,30 @@ class OCRPipeline:
             
             model_name = "microsoft/trocr-base-printed"
 
-            # Prefer GPU if available: try DirectML first (for AMD on Windows), then CUDA, then CPU
+            # Prefer GPU if available: try CUDA first, then DirectML (AMD/Intel), then CPU
+            device = None
+            device_name = "cpu"
             try:
-                import torch_directml
-                device = torch_directml.device()
-                device_name = "DirectML (AMD GPU)"
-                logger.info("Using DirectML device for GPU acceleration")
-            except Exception:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                device_name = str(device)
-                logger.info("Using device: %s", device_name)
+                if torch.cuda.is_available():
+                    device = torch.device("cuda")
+                    device_name = "cuda"
+                    logger.info("Using CUDA device for GPU acceleration")
+            except Exception as exc:
+                logger.info("CUDA check failed: %s", exc)
+
+            if device is None:
+                try:
+                    import torch_directml  # type: ignore
+                    device = torch_directml.device()
+                    device_name = "DirectML"
+                    logger.info("Using DirectML device for GPU acceleration")
+                except Exception as exc:
+                    logger.info("DirectML unavailable: %s", exc)
+
+            if device is None:
+                device = torch.device("cpu")
+                device_name = "cpu"
+                logger.info("Using CPU device for OCR")
 
             processor = TrOCRProcessor.from_pretrained(model_name)
 

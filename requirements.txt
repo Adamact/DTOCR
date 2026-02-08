@@ -17,7 +17,6 @@ packaging==26.0
 pandas==2.3.3
 pillow==12.1.0
 pypdfium2==4.30.0
-pytesseract==0.3.13
 python-dateutil==2.9.0.post0
 pytz==2025.2
 PyYAML==6.0.3

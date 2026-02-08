@@ -195,6 +195,7 @@ class App:
             "document_type": doc_type,
             "regions": [],
             "dpi": 300,
+            "text_mode": "auto",
         }
         self.template_service.save_template_version(template_id=template_id, payload=payload)
 

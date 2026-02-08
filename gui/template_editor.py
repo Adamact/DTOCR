@@ -76,6 +76,7 @@ class TemplateEditor:
         ]
         self.source_pdf = template_payload.get("source_pdf", "")
         self.dpi_var = tk.StringVar(value=str(template_payload.get("dpi", 300)))
+        self.text_mode_var = tk.StringVar(value=str(template_payload.get("text_mode", "auto")))
         self.detection_settings = merge_detection_settings(template_payload.get("detection_settings"))
         self.row_content_threshold_var = tk.StringVar()
         self.min_row_height_pct_var = tk.StringVar()
@@ -280,6 +281,16 @@ class TemplateEditor:
         dpi_spin = ttk.Spinbox(sidebar_inner, from_=72, to=600, textvariable=self.dpi_var, width=8)
         dpi_spin.pack(anchor="w", pady=(0, 8))
         _block_mousewheel(dpi_spin)
+
+        ttk.Label(sidebar_inner, text="Extraction Mode").pack(anchor="w", pady=(2, 0))
+        mode_select = ttk.Combobox(
+            sidebar_inner,
+            textvariable=self.text_mode_var,
+            values=("auto", "ocr_only", "text_only"),
+            state="readonly",
+            width=12,
+        )
+        mode_select.pack(anchor="w", pady=(0, 8))
 
         ttk.Button(sidebar_inner, text="Delete Region", command=self._delete_region).pack(fill=tk.X)
         ttk.Button(sidebar_inner, text="Save Template", command=self._save_template).pack(fill=tk.X, pady=(8, 0))
@@ -689,6 +700,7 @@ class TemplateEditor:
         payload["regions"] = [region.to_payload() for region in self.regions]
         payload["source_pdf"] = self.source_pdf
         payload["dpi"] = self._parse_dpi()
+        payload["text_mode"] = str(self.text_mode_var.get() or "auto")
         payload["detection_settings"] = self._parse_detection_settings()
         self.template_service.save_template_version(template_id=self.template_id, payload=payload)
         messagebox.showinfo("Saved", "Template regions saved.")
