@@ -14,7 +14,7 @@ def main() -> None:
     configure_logging()
 
     # 2) Initialize DB
-    data_dir = Path.cwd() / "data"
+    data_dir = Path(__file__).resolve().parents[1] / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "DTOCR.sqlite3"
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from services.template_service import TemplateService
+from DTOCR.services.service_factory import create_template_service  # type: ignore
 
 
 def run_pipeline(
@@ -14,14 +14,8 @@ def run_pipeline(
     batch_size: int = 8,
     num_beams: int = 1,
 ) -> dict[str, Any]:
-    """
-    Headless adapter for running the existing DTOCR pipeline from a background worker.
-
-    This function is the single integration point between the web stack and your current codebase.
-    """
-    service = TemplateService()
-
-    result = service.run_ocr_pipeline(
+    service = create_template_service()
+    return service.run_ocr_pipeline(
         template_payload=template_payload,
         pdf_path=pdf_path,
         excel_path=excel_path,
@@ -30,4 +24,3 @@ def run_pipeline(
         batch_size=batch_size,
         num_beams=num_beams,
     )
-    return result
