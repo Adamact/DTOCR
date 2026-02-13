@@ -259,7 +259,11 @@ class OCRPipeline:
             if device is None:
                 try:
                     import torch_directml  # type: ignore
-                    device = torch_directml.device()
+
+                    dml_device = torch_directml.device()
+                    # Probe a tiny allocation to ensure DirectML is usable on this host.
+                    _ = torch.zeros(1, device=dml_device)
+                    device = dml_device
                     device_name = "DirectML"
                     logger.info("Using DirectML device for GPU acceleration")
                 except Exception as exc:
