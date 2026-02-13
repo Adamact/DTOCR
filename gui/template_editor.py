@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 from DTOCR.services.template_service import TemplateService
 from DTOCR.core.grid_detector import auto_detect_grid_structure, default_detection_settings, merge_detection_settings
 from DTOCR.core.pdf_renderer import PdfDocument, PdfRect, scale_from_dpi
+from DTOCR.parsers.registry import available_parsers, get_parser
 
 
 @dataclass
@@ -77,6 +78,12 @@ class TemplateEditor:
         self.source_pdf = template_payload.get("source_pdf", "")
         self.dpi_var = tk.StringVar(value=str(template_payload.get("dpi", 300)))
         self.text_mode_var = tk.StringVar(value=str(template_payload.get("text_mode", "auto")))
+        self.parser_options = available_parsers()
+        self.parser_placeholder = "<select>"
+        current_parser = str(template_payload.get("parser_name", "")).strip()
+        if not current_parser or current_parser not in self.parser_options:
+            current_parser = self.parser_placeholder
+        self.parser_name_var = tk.StringVar(value=current_parser)
         self.detection_settings = merge_detection_settings(template_payload.get("detection_settings"))
         self.row_content_threshold_var = tk.StringVar()
         self.min_row_height_pct_var = tk.StringVar()
@@ -291,6 +298,17 @@ class TemplateEditor:
             width=12,
         )
         mode_select.pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(sidebar_inner, text="Parser").pack(anchor="w", pady=(2, 0))
+        parser_values = [self.parser_placeholder] + list(self.parser_options)
+        parser_select = ttk.Combobox(
+            sidebar_inner,
+            textvariable=self.parser_name_var,
+            values=parser_values,
+            state="readonly",
+            width=16,
+        )
+        parser_select.pack(anchor="w", pady=(0, 8))
 
         ttk.Button(sidebar_inner, text="Delete Region", command=self._delete_region).pack(fill=tk.X)
         ttk.Button(sidebar_inner, text="Save Template", command=self._save_template).pack(fill=tk.X, pady=(8, 0))
@@ -697,11 +715,21 @@ class TemplateEditor:
 
     def _save_template(self) -> None:
         payload = dict(self.template_payload)
+        parser_name = str(self.parser_name_var.get() or "").strip()
+        if not parser_name or parser_name == self.parser_placeholder:
+            messagebox.showerror("Parser Required", "Select a parser before saving the template.")
+            return
+        try:
+            get_parser(parser_name)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Parser", str(exc))
+            return
         payload["regions"] = [region.to_payload() for region in self.regions]
         payload["source_pdf"] = self.source_pdf
         payload["dpi"] = self._parse_dpi()
         payload["text_mode"] = str(self.text_mode_var.get() or "auto")
         payload["detection_settings"] = self._parse_detection_settings()
+        payload["parser_name"] = parser_name
         self.template_service.save_template_version(template_id=self.template_id, payload=payload)
         messagebox.showinfo("Saved", "Template regions saved.")
 

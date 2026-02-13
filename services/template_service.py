@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 import re
 import tempfile
 from pathlib import Path
@@ -256,14 +256,37 @@ class TemplateService:
 
         return {"output_dir": str(output_dir), "crops": crops}
 
-    def run_ocr_pipeline(self, template_payload: dict[str, Any], pdf_path: str, excel_path: str | None = None, word_kernel_divisor: int | None = None, save_crops: bool = True, batch_size: int = 8, num_beams: int = 1) -> dict[str, Any]:
+    def run_ocr_pipeline(
+        self,
+        template_payload: dict[str, Any],
+        pdf_path: str,
+        excel_path: str | None = None,
+        word_kernel_divisor: int | None = None,
+        save_crops: bool = True,
+        batch_size: int = 8,
+        num_beams: int = 1,
+        progress_callback: Callable[[int, int], None] | None = None,
+        dev_mode: bool = False,
+    ) -> dict[str, Any]:
         crop_result = self.apply_template_to_pdf(template_payload, pdf_path, word_kernel_divisor=word_kernel_divisor, save_crops=save_crops)
         crops = crop_result.get("crops", [])
         output_dir = crop_result.get("output_dir", "")
         if not crops or not output_dir:
             return {"output_dir": output_dir, "crops": crops, "results": []}
+        parser_name = str(template_payload.get("parser_name", "")).strip()
+        if not parser_name:
+            raise RuntimeError("Template payload missing parser_name; configure parser before running OCR.")
         pipeline = OCRPipeline()
-        ocr_result = pipeline.run(crops=crops, output_dir=output_dir, excel_path=excel_path, batch_size=batch_size, num_beams=num_beams)
+        ocr_result = pipeline.run(
+            crops=crops,
+            output_dir=output_dir,
+            parser_name=parser_name,
+            excel_path=excel_path,
+            batch_size=batch_size,
+            num_beams=num_beams,
+            progress_callback=progress_callback,
+            dev_mode=dev_mode,
+        )
         return {
             "output_dir": output_dir,
             "crops": crops,

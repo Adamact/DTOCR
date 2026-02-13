@@ -4,16 +4,28 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image
 
-from DTOCR.core import text_parsers
+from DTOCR.parsers.registry import get_parser
 
 
 @dataclass
 class OCRPipeline:
-    def run(self, crops: list[dict[str, Any]], output_dir: str, excel_path: str | None = None, batch_size: int = 8, num_beams: int = 1, max_length: int = 128, image_load_workers: int = 4) -> dict[str, Any]:
+    def run(
+        self,
+        crops: list[dict[str, Any]],
+        output_dir: str,
+        parser_name: str | None,
+        excel_path: str | None = None,
+        batch_size: int = 8,
+        num_beams: int = 1,
+        max_length: int = 128,
+        image_load_workers: int = 4,
+        progress_callback: Callable[[int, int], None] | None = None,
+        dev_mode: bool = False,
+    ) -> dict[str, Any]:
         import logging
         import sys
         import torch  # type: ignore
@@ -37,7 +49,7 @@ class OCRPipeline:
         processed_pages_seen: set[int] = set()
 
         def _print_progress(done: int, total: int) -> None:
-            if total <= 0:
+            if not dev_mode or total <= 0:
                 return
             percent = int((done / total) * 100)
             bar_len = 40
@@ -49,6 +61,8 @@ class OCRPipeline:
         if total_work > 0:
             logger.info("Starting OCR (TrOCR): %s cells across %s pages (estimated work=%s)", total_cells, total_pages, total_work)
             _print_progress(0, total_work)
+            if progress_callback:
+                progress_callback(0, total_work)
 
         # Process in batches for speed
         def _batches(iterable, n):
@@ -67,6 +81,8 @@ class OCRPipeline:
             if total_work > 0:
                 _print_progress(work_done, total_work)
                 logger.debug("Progress update: done=%s/%s (cells=%s pages=%s)", work_done, total_work, processed_cells, processed_pages)
+                if progress_callback:
+                    progress_callback(work_done, total_work)
 
         with torch.no_grad():
             for batch in _batches(crops, batch_size):
@@ -196,10 +212,13 @@ class OCRPipeline:
         # Finalize progress bar
         if total_work > 0:
             _print_progress(total_work, total_work)
-            print("")
+            if dev_mode:
+                print("")
             logger.info("OCR progress complete: processed %s work units", total_work)
+            if progress_callback:
+                progress_callback(total_work, total_work)
 
-        output_path = self._write_results(results, output_dir, excel_path)
+        output_path = self._write_results(results, output_dir, parser_name, excel_path)
         logger.info("Wrote OCR JSON to %s", output_path)
         print(f"OCR results written to: {output_path}")
         if excel_path:
@@ -280,15 +299,15 @@ class OCRPipeline:
         return self._trocr_model, self._trocr_processor, self._trocr_device
 
 
-    def _write_results(self, results: list[dict[str, Any]], output_dir: str, excel_path: str | None = None) -> Path:
+    def _write_results(self, results: list[dict[str, Any]], output_dir: str, parser_name: str | None, excel_path: str | None = None) -> Path:
         output_path = Path(output_dir) / "ocr_results.json"
         with output_path.open("w", encoding="utf-8") as handle:
             json.dump(results, handle, ensure_ascii=True, indent=2)
         if excel_path:
-            self._export_to_excel(results, excel_path)
+            self._export_to_excel(results, excel_path, parser_name)
         return output_path
 
-    def _export_to_excel(self, results: list[dict[str, Any]], excel_path: str) -> Path:
+    def _export_to_excel(self, results: list[dict[str, Any]], excel_path: str, parser_name: str | None) -> Path:
         try:
             import pandas as pd  # type: ignore
         except Exception as exc:
@@ -302,7 +321,15 @@ class OCRPipeline:
         # Separate grid results from non-grid results
         grid_results = [r for r in results if r.get("grid_id") is not None and r.get("row_index") is not None]
         non_grid_results = [r for r in results if r.get("grid_id") is None]
+
+        # Preserve template ordering: map label -> first-seen index based on incoming result order
+        label_order: dict[str, int] = {}
+        for item in non_grid_results:
+            label = str(item.get("label", ""))
+            if label not in label_order:
+                label_order[label] = len(label_order)
         parsed_rows: list[dict[str, Any]] = []
+        parsed_grid_rows: list[dict[str, Any]] = []
         carry_by_label: dict[str, dict[str, Any] | None] = {}
         def _text_to_rows(text: str) -> list[list[str]]:
             rows: list[list[str]] = []
@@ -316,13 +343,25 @@ class OCRPipeline:
                     rows.append(cells)
             return rows
 
+        if not parser_name or not str(parser_name).strip():
+            raise RuntimeError("Template payload missing parser_name; configure parser before running OCR.")
+        parser = get_parser(parser_name)
+        if parser.parse_grid and grid_results:
+            parsed_grid_rows = parser.parse_grid(grid_results)
+
         structured_items = [
             item
             for item in non_grid_results
             if isinstance(item.get("structured_rows"), list) or isinstance(item.get("text"), str)
         ]
-        structured_items.sort(key=lambda i: (str(i.get("label", "")), int(i.get("page", 0))))
-        parser_type = text_parsers.detect_parser_type(non_grid_results)
+
+        # Keep the parsed text rows in the same label order as the template (first appearance wins)
+        structured_items.sort(
+            key=lambda i: (
+                label_order.get(str(i.get("label", "")), len(label_order)),
+                int(i.get("page", 0)),
+            )
+        )
         for item in structured_items:
             structured_rows = item.get("structured_rows")
             if not isinstance(structured_rows, list) or not structured_rows:
@@ -336,10 +375,7 @@ class OCRPipeline:
             if not label.startswith("data_field"):
                 continue
             carry = carry_by_label.get(label)
-            if parser_type == "layout-b":
-                records, carry = text_parsers.parse_structured_rows_layout_b_with_carry(structured_rows, carry)
-            else:
-                records, carry = text_parsers.parse_structured_rows_with_carry(structured_rows, carry)
+            records, carry = parser.parse_with_carry(structured_rows, carry)
             carry_by_label[label] = carry
             for record in records:
                 record["label"] = label
@@ -350,29 +386,11 @@ class OCRPipeline:
                 carry["label"] = label
                 parsed_rows.append(carry)
 
-        def _has_value(value: Any) -> bool:
-            if value is None:
-                return False
-            if isinstance(value, bool):
-                return value is True
-            return str(value).strip() != ""
-
-        def _keep_row(row: dict[str, Any]) -> bool:
-            bilnr = row.get("bilnr")
-            levdag = row.get("levdag")
-            return _has_value(bilnr) and _has_value(levdag)
-
         if parsed_rows:
-            if parser_type == "layout-b":
-                parsed_rows = [row for row in parsed_rows if _keep_row(row)]
-            else:
-                parsed_rows = [
-                    row
-                    for row in parsed_rows
-                    if _has_value(row.get("bilregnr")) and _has_value(row.get("delivery_date"))
-                ]
+            if parser.row_filter:
+                parsed_rows = [row for row in parsed_rows if parser.row_filter(row)]
         
-        if not grid_results and not parsed_rows:
+        if not grid_results and not parsed_rows and not parsed_grid_rows:
             # If no grid or parsed results, export non-grid results with minimal columns
             minimal_rows = [
                 {"label": r.get("label", ""), "page": r.get("page", 0), "text": r.get("text", "")}
@@ -382,7 +400,7 @@ class OCRPipeline:
             df.to_excel(excel_p, index=False, engine="openpyxl")
             return excel_p
 
-        # Group results by grid_label (each grid gets its own sheet)
+        # Group results by grid_label so pages/regions for the same logical grid stay together in one sheet
         from collections import defaultdict
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in grid_results:
@@ -397,27 +415,12 @@ class OCRPipeline:
             # Write structured text results (parsed via regex) if available
             if parsed_rows:
                 df_parsed = pd.DataFrame(parsed_rows)
-                if parser_type == "layout-b":
-                    preferred = [
-                        "foljesedel",
-                        "levdag",
-                        "bilnr",
-                        "produktnamn",
-                        "enhet",
-                        "kvantitet",
-                        "a_pris",
-                        "belopp_sek",
-                        "takt_miljoavgift",
-                        "vintertillagg",
-                    ]
-                    sheet_name = "Parsed_Text_LayoutB"
-                else:
-                    preferred = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
-                    sheet_name = "Parsed_Text"
-                ordered = [col for col in preferred if col in df_parsed.columns]
+                ordered = [col for col in parser.preferred_columns if col in df_parsed.columns]
                 remaining = [col for col in df_parsed.columns if col not in ordered]
                 df_parsed = df_parsed[ordered + remaining]
-                df_parsed.to_excel(writer, index=False, sheet_name=sheet_name)
+                df_parsed.to_excel(writer, index=False, sheet_name=parser.sheet_name)
+
+            # We render grids below as matrix sheets; skip raw per-cell grid rows here to avoid duplicate/long format
 
             # Write non-grid results with minimal columns (no meta)
             if non_grid_results:
@@ -428,34 +431,44 @@ class OCRPipeline:
                 df = pd.DataFrame(minimal_rows)
                 df.to_excel(writer, index=False, sheet_name="OCR_Results")
 
-            # For each grid, map directly: template row N → Excel row N, template col M → Excel col M
-            # Pages after the first continue filling rows
+            # For each grid, map directly: template row N → Excel row N, template col M → Excel col M using row/col indices
+            # Pages after the first continue filling rows for the same grid
             for grid_label, items in groups.items():
-                # Get all unique columns and rows
-                cols = sorted(
-                    {
+                # Collect columns ordered by template col_index (dedupe labels while preserving order)
+                raw_cols = sorted(
+                    [
                         (int(r.get("col_index", 0)), str(r.get("column_label", f"Column {int(r.get('col_index', 0)) + 1}")))
                         for r in items
-                    },
+                    ],
                     key=lambda x: x[0],
                 )
-                col_labels = [label for _, label in cols]
-                col_map = {idx: label for idx, label in cols}
 
-                # Get all unique rows across all pages
-                rows = sorted({int(r.get("row_index", 0)) for r in items})
-                
-                # Get page numbers and their starting row in Excel
-                pages = sorted({int(r.get("page_number", r.get("page", 0))) for r in items if int(r.get("page_number", r.get("page", 0))) > 0})
+                # Deduplicate by col_index (one header per template column), preserve order by col_index
+                col_map: dict[int, str] = {}
+                used_labels: set[str] = set()
+                for idx, label in raw_cols:
+                    if idx in col_map:
+                        continue
+                    name = label if label not in used_labels else f"{label} (c{idx + 1})"
+                    used_labels.add(name)
+                    col_map[idx] = name
 
-                # Build table with rows continuing across pages
+                col_labels = [col_map[i] for i in sorted(col_map.keys())]
+
+                # Collect pages present in this grid (allow zero/absent, fallback to 1 if still empty)
+                pages = sorted({int(r.get("page_number", r.get("page", 1))) for r in items}) or [1]
+
                 table_rows: list[dict[str, Any]] = []
                 for page_num in pages:
-                    for template_row_idx in rows:
-                        row_dict = {"page": page_num}
+                    # Row indices seen on this page keep template order
+                    rows_for_page = sorted({int(r.get("row_index", 0)) for r in items if int(r.get("page_number", r.get("page", 1))) == page_num})
+                    for template_row_idx in rows_for_page:
+                        row_dict: dict[str, Any] = {"page": page_num, "row_index": template_row_idx}
                         row_dict.update({label: "" for label in col_labels})
                         for item in items:
-                            if int(item.get("page_number", item.get("page", 0))) != page_num or int(item.get("row_index", 0)) != template_row_idx:
+                            if int(item.get("page_number", item.get("page", 1))) != page_num:
+                                continue
+                            if int(item.get("row_index", 0)) != template_row_idx:
                                 continue
                             col_idx = int(item.get("col_index", 0))
                             col_label = col_map.get(col_idx, f"Column {col_idx + 1}")
@@ -463,6 +476,8 @@ class OCRPipeline:
                         table_rows.append(row_dict)
 
                 grid_df = pd.DataFrame(table_rows)
+                # Order columns: page, row_index, then grid columns
+                grid_df = grid_df[["page", "row_index", *col_labels]] if not grid_df.empty else pd.DataFrame(columns=["page", "row_index", *col_labels])
                 sheet_name = _sheet_name(grid_label)
                 grid_df.to_excel(writer, index=False, sheet_name=sheet_name)
 

@@ -5,6 +5,7 @@ from tkinter import ttk, messagebox, filedialog
 from typing import Any
 
 from DTOCR.services.template_service import TemplateService
+from DTOCR.parsers.registry import available_parsers
 from DTOCR.gui.template_editor import TemplateEditor
 
 # PIL is optional (for annotated image viewer). If missing, the viewer falls back to telling user where images were saved.
@@ -35,10 +36,15 @@ class App:
         self.root.title("OCR App (MVP Skeleton)")
         self.root.geometry("700x600")
 
-        self._ocr_queue: "queue.Queue[tuple[bool, object]]" = queue.Queue()
+        self._ocr_queue: "queue.Queue[tuple[str, object, object | None]]" = queue.Queue()
         self._ocr_running = False
         self.run_ocr_button: ttk.Button | None = None
         self.ocr_status_var = tk.StringVar(value="")
+        self.dev_mode_var = tk.BooleanVar(value=False)
+        self.ocr_progress_var = tk.DoubleVar(value=0.0)
+        self.ocr_progress_label_var = tk.StringVar(value="0% (0/0)")
+        self._ocr_progress_done = 0
+        self._ocr_progress_total = 0
 
         self._build_ui()
         self._refresh_templates()
@@ -99,6 +105,14 @@ class App:
         self.ocr_num_beams_var = tk.IntVar(value=1)
         self.ocr_num_beams_spin = ttk.Spinbox(settings, from_=1, to=8, textvariable=self.ocr_num_beams_var, width=5)
         self.ocr_num_beams_spin.pack(side=tk.LEFT)
+        ttk.Checkbutton(settings, text="Dev mode", variable=self.dev_mode_var).pack(side=tk.LEFT, padx=(16, 0))
+
+        progress_frame = ttk.Frame(container)
+        progress_frame.pack(fill=tk.X, pady=(4, 6))
+        self.ocr_progress_label = ttk.Label(progress_frame, textvariable=self.ocr_progress_label_var)
+        self.ocr_progress_label.pack(side=tk.LEFT, padx=(0, 6))
+        self.ocr_progress_bar = ttk.Progressbar(progress_frame, mode="determinate", maximum=100, variable=self.ocr_progress_var)
+        self.ocr_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Live preview controls
         self.preview_image_path: str | None = None
@@ -198,6 +212,8 @@ class App:
         template_id = self.template_service.create_template(name=name, vendor=vendor, document_type=doc_type)
 
         # For now, save an initial empty version payload.
+        parser_options = available_parsers()
+        default_parser = parser_options[0] if parser_options else ""
         payload = {
             "template_id": template_id,
             "name": name,
@@ -206,6 +222,7 @@ class App:
             "regions": [],
             "dpi": 300,
             "text_mode": "auto",
+            "parser_name": default_parser,
         }
         self.template_service.save_template_version(template_id=template_id, payload=payload)
 
@@ -401,6 +418,9 @@ class App:
     def _start_ocr_thread(self, payload: dict[str, Any], pdf_path: str, excel_path: str | None, divisor: int | None, batch_size: int, num_beams: int) -> None:
         def worker() -> None:
             try:
+                def progress_callback(done: int, total: int) -> None:
+                    self._ocr_queue.put(("progress", done, total))
+
                 result = self.template_service.run_ocr_pipeline(
                     payload,
                     pdf_path,
@@ -408,18 +428,34 @@ class App:
                     word_kernel_divisor=divisor,
                     batch_size=batch_size,
                     num_beams=num_beams,
+                    progress_callback=progress_callback,
+                    dev_mode=bool(self.dev_mode_var.get()),
                 )
-                self._ocr_queue.put((True, result))
+                self._ocr_queue.put(("result", True, result))
             except Exception as exc:
-                self._ocr_queue.put((False, exc))
+                self._ocr_queue.put(("result", False, exc))
 
         threading.Thread(target=worker, daemon=True).start()
         self.root.after(100, self._poll_ocr_queue)
 
     def _poll_ocr_queue(self) -> None:
-        try:
-            ok, payload = self._ocr_queue.get_nowait()
-        except queue.Empty:
+        result_ready = False
+        ok = False
+        payload: object | None = None
+        while True:
+            try:
+                kind, data, extra = self._ocr_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                self._set_ocr_progress(int(data), int(extra or 0))
+                continue
+            if kind == "result":
+                result_ready = True
+                ok = bool(data)
+                payload = extra
+
+        if not result_ready:
             self.root.after(100, self._poll_ocr_queue)
             return
 
@@ -431,6 +467,9 @@ class App:
             else:
                 messagebox.showerror("OCR Failed", str(payload))
             return
+
+        if self._ocr_progress_total > 0:
+            self._set_ocr_progress(self._ocr_progress_total, self._ocr_progress_total)
 
         result = payload
         # If a preview image is selected and live preview is enabled, refresh it
@@ -472,6 +511,24 @@ class App:
                 pass
         try:
             self.ocr_status_var.set("OCR running..." if running else "")
+        except Exception:
+            pass
+        if running:
+            self._set_ocr_progress(0, 1)
+        else:
+            if self._ocr_progress_total == 0:
+                self._set_ocr_progress(0, 1)
+
+    def _set_ocr_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            return
+        self._ocr_progress_done = max(0, done)
+        self._ocr_progress_total = max(1, total)
+        percent = int((self._ocr_progress_done / self._ocr_progress_total) * 100)
+        percent = max(0, min(100, percent))
+        try:
+            self.ocr_progress_var.set(percent)
+            self.ocr_progress_label_var.set(f"{percent}% ({self._ocr_progress_done}/{self._ocr_progress_total})")
         except Exception:
             pass
 

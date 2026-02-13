@@ -4,14 +4,6 @@ from typing import Any
 import re
 import unicodedata
 
-def detect_parser_type(results: list[dict[str, Any]]) -> str:
-    text_blob = " ".join(str(r.get("text", "")) for r in results).lower()
-    if "layout b marker" in text_blob:
-        return "layout-b"
-    if "layout-a" in text_blob:
-        return "layout-a"
-    return "layout-a"
-
 
 def parse_structured_rows(rows: list[list[str]]) -> list[dict[str, Any]]:
     records, carry = parse_structured_rows_with_carry(rows, None)
@@ -157,7 +149,6 @@ def parse_structured_rows_with_carry(
 def parse_structured_rows_layout_b_with_carry(
     rows: list[list[str]], carry: dict[str, Any] | None
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    
     def _extract_numbers(line: str) -> list[str]:
         return re.findall(r"\d{1,3}(?:[ \u00A0]\d{3})*(?:,\d+)?", line)
 
@@ -171,11 +162,11 @@ def parse_structured_rows_layout_b_with_carry(
 
     def _is_fee_line(line: str) -> bool:
         lowered = line.lower()
-        return "täkt" in lowered and "miljö" in lowered
+        return "t\u00e4kt" in lowered and "milj\u00f6" in lowered
 
     def _is_winter_line(line: str) -> bool:
         lowered = line.lower()
-        return "vintertillägg" in lowered or "vintertillagg" in lowered
+        return "vintertill\u00e4gg" in lowered or "vintertillagg" in lowered
 
     def _extract_unit(line: str) -> str | None:
         match = re.search(r"\b(ton|kg|m3|m2|st)\b", line.lower())
@@ -308,3 +299,20 @@ def parse_structured_rows_layout_b_with_carry(
             last_fee_target = parsed
 
     return records, current
+
+
+def parse_grid_cells(grid_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parsed_rows: list[dict[str, Any]] = []
+    for item in grid_results:
+        parsed_rows.append(
+            {
+                "grid_label": item.get("grid_label", ""),
+                "page": item.get("page", 0),
+                "row_index": item.get("row_index", 0),
+                "col_index": item.get("col_index", 0),
+                "column_label": item.get("column_label", ""),
+                "cell_label": item.get("cell_label", ""),
+                "text": item.get("text", ""),
+            }
+        )
+    return parsed_rows
