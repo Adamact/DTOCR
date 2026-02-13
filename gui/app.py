@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from typing import Any
 
 from DTOCR.services.template_service import TemplateService
 from DTOCR.gui.template_editor import TemplateEditor
@@ -21,6 +22,8 @@ import os
 import tempfile
 import shutil
 import logging
+import threading
+import queue
 from pathlib import Path
 
 
@@ -31,6 +34,11 @@ class App:
         self.root = tk.Tk()
         self.root.title("OCR App (MVP Skeleton)")
         self.root.geometry("700x600")
+
+        self._ocr_queue: "queue.Queue[tuple[bool, object]]" = queue.Queue()
+        self._ocr_running = False
+        self.run_ocr_button: ttk.Button | None = None
+        self.ocr_status_var = tk.StringVar(value="")
 
         self._build_ui()
         self._refresh_templates()
@@ -128,8 +136,10 @@ class App:
         ttk.Button(actions, text="Edit Template Regions", command=self._on_edit_template).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Manage Labels", command=self._on_manage_labels).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Apply Template to PDF", command=self._on_apply_template).pack(side=tk.LEFT, padx=4)
-        ttk.Button(actions, text="Run OCR Pipeline", command=self._on_run_ocr).pack(side=tk.LEFT, padx=4)
+        self.run_ocr_button = ttk.Button(actions, text="Run OCR Pipeline", command=self._on_run_ocr)
+        self.run_ocr_button.pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Delete Template", command=self._on_delete_template).pack(side=tk.LEFT, padx=4)
+        ttk.Label(actions, textvariable=self.ocr_status_var).pack(side=tk.LEFT, padx=(8, 0))
 
         # Preview pane with scrollable canvas and zoom controls
         preview_frame = ttk.LabelFrame(container, text="Preview", padding=6)
@@ -356,6 +366,9 @@ class App:
         except Exception:
             pass
     def _on_run_ocr(self) -> None:
+        if self._ocr_running:
+            messagebox.showinfo("OCR Busy", "OCR is already running.")
+            return
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("Select Template", "Please select a template to apply.")
@@ -382,11 +395,44 @@ class App:
         divisor = None
         batch_size = int(self.ocr_batch_size_var.get() or 8)
         num_beams = int(self.ocr_num_beams_var.get() or 1)
+        self._set_ocr_running(True)
+        self._start_ocr_thread(payload, pdf_path, excel_path, divisor, batch_size, num_beams)
+
+    def _start_ocr_thread(self, payload: dict[str, Any], pdf_path: str, excel_path: str | None, divisor: int | None, batch_size: int, num_beams: int) -> None:
+        def worker() -> None:
+            try:
+                result = self.template_service.run_ocr_pipeline(
+                    payload,
+                    pdf_path,
+                    excel_path=excel_path,
+                    word_kernel_divisor=divisor,
+                    batch_size=batch_size,
+                    num_beams=num_beams,
+                )
+                self._ocr_queue.put((True, result))
+            except Exception as exc:
+                self._ocr_queue.put((False, exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(100, self._poll_ocr_queue)
+
+    def _poll_ocr_queue(self) -> None:
         try:
-            result = self.template_service.run_ocr_pipeline(payload, pdf_path, excel_path=excel_path, word_kernel_divisor=divisor, batch_size=batch_size, num_beams=num_beams)
-        except RuntimeError as exc:
-            messagebox.showerror("OCR Unavailable", str(exc))
+            ok, payload = self._ocr_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(100, self._poll_ocr_queue)
             return
+
+        self._set_ocr_running(False)
+
+        if not ok:
+            if isinstance(payload, RuntimeError):
+                messagebox.showerror("OCR Unavailable", str(payload))
+            else:
+                messagebox.showerror("OCR Failed", str(payload))
+            return
+
+        result = payload
         # If a preview image is selected and live preview is enabled, refresh it
         try:
             if self.live_preview_var.get() and self.preview_image_path:
@@ -412,7 +458,20 @@ class App:
         )
         # Show annotated images when present (helpful to visualize the chosen kernel)
         try:
-            self._show_annotated_images(output_dir, divisor)
+            self._show_annotated_images(output_dir, None)
+        except Exception:
+            pass
+
+    def _set_ocr_running(self, running: bool) -> None:
+        self._ocr_running = running
+        if self.run_ocr_button is not None:
+            state = "disabled" if running else "normal"
+            try:
+                self.run_ocr_button.config(state=state)
+            except Exception:
+                pass
+        try:
+            self.ocr_status_var.set("OCR running..." if running else "")
         except Exception:
             pass
 
