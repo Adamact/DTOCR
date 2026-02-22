@@ -14,3 +14,9 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime artifacts
+storage/
+
+# Local mail ingestor config (keep example file tracked)
+config/mail_ingestor.yaml

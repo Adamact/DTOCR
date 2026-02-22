@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from DTOCR.core.logging import configure_logging # type: ignore
-from DTOCR.db.sqlite import Database # type: ignore
-from DTOCR.db.repositories import TemplateRepository # type: ignore
-from DTOCR.services.template_service import TemplateService # type: ignore
+from DTOCR.services.service_factory import create_template_service  # type: ignore
 from DTOCR.gui.app import App # type: ignore
 
 
@@ -13,19 +9,11 @@ def main() -> None:
     # 1) Initialize logging
     configure_logging()
 
-    # 2) Initialize DB
-    data_dir = Path(__file__).resolve().parents[1] / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = data_dir / "DTOCR.sqlite3"
+    # 2) Create service object using shared DB path resolution
+    # (explicit arg > DTOCR_DB_PATH > project-local data/DTOCR.sqlite3)
+    template_service = create_template_service()
 
-    db = Database(db_path=db_path)
-    db.initialize()  # creates tables if missing
-
-    # 3) Create service objects (dependency injection)
-    template_repo = TemplateRepository(db=db)
-    template_service = TemplateService(template_repo=template_repo)
-
-    # 4) Start GUI
+    # 3) Start GUI
     app = App(template_service=template_service)
     app.run()
 

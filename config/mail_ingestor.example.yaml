@@ -1,0 +1,32 @@
+poll:
+  interval_seconds: 30
+  max_messages_per_cycle: 10
+  reconnect_backoff_seconds: [5, 15, 30, 60, 300]
+
+mailbox:
+  inbox: INBOX
+  processed_folder: DTOCR/Processed
+  failed_folder: DTOCR/Failed
+  search_criterion: UNSEEN
+
+routing:
+  exact_senders:
+    invoices@vendor-a.com: 12
+  sender_domains:
+    vendor-b.com: 7
+
+ocr_defaults:
+  batch_size: 8
+  num_beams: 1
+  word_kernel_divisor: null
+  save_crops: true
+
+attachments:
+  process_all_pdfs: true
+  max_pdf_attachments_per_email: 10
+  max_pdf_size_mb: 25
+
+reply:
+  subject_prefix: "[DTOCR]"
+  include_excel: true
+  include_json: false

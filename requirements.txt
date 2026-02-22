@@ -19,6 +19,7 @@ pillow==12.1.0
 pypdfium2==4.30.0
 python-dateutil==2.9.0.post0
 pytz==2025.2
+# Mail ingestor config loading
 PyYAML==6.0.3
 regex==2026.1.15
 requests==2.32.5
@@ -30,6 +31,8 @@ tokenizers==0.22.2
 torch==2.10.0
 torchaudio==2.10.0
 torchvision==0.25.0
+# Windows GPU acceleration path used by OCRPipeline (DirectML)
+torch-directml
 tqdm==4.67.1
 transformers==4.57.6
 typing_extensions==4.15.0

@@ -232,6 +232,7 @@ class OCRPipeline:
 
     def _require_trocr(self):
         try:
+            import os
             import torch  # type: ignore
             from transformers import TrOCRProcessor, VisionEncoderDecoderModel  # type: ignore
         except Exception as exc:
@@ -244,19 +245,31 @@ class OCRPipeline:
             logger = logging.getLogger(__name__)
             
             model_name = "microsoft/trocr-base-printed"
+            requested_device = str(os.getenv("DTOCR_OCR_DEVICE", "auto") or "auto").strip().lower()
+            if requested_device not in {"auto", "cpu", "cuda", "directml"}:
+                logger.warning(
+                    "Unknown DTOCR_OCR_DEVICE=%r; falling back to auto (supported: auto, cpu, cuda, directml)",
+                    requested_device,
+                )
+                requested_device = "auto"
 
-            # Prefer GPU if available: try CUDA first, then DirectML (AMD/Intel), then CPU
+            # Device selection
+            # Default ('auto') prefers CUDA, then CPU. DirectML is opt-in via DTOCR_OCR_DEVICE=directml
+            # because some hosts produce poor OCR quality with TrOCR on DirectML.
             device = None
             device_name = "cpu"
-            try:
-                if torch.cuda.is_available():
-                    device = torch.device("cuda")
-                    device_name = "cuda"
-                    logger.info("Using CUDA device for GPU acceleration")
-            except Exception as exc:
-                logger.info("CUDA check failed: %s", exc)
+            if requested_device in {"auto", "cuda"}:
+                try:
+                    if torch.cuda.is_available():
+                        device = torch.device("cuda")
+                        device_name = "cuda"
+                        logger.info("Using CUDA device for GPU acceleration")
+                    elif requested_device == "cuda":
+                        logger.warning("DTOCR_OCR_DEVICE=cuda requested, but CUDA is not available. Falling back.")
+                except Exception as exc:
+                    logger.info("CUDA check failed: %s", exc)
 
-            if device is None:
+            if device is None and requested_device == "directml":
                 try:
                     import torch_directml  # type: ignore
 
@@ -265,9 +278,21 @@ class OCRPipeline:
                     _ = torch.zeros(1, device=dml_device)
                     device = dml_device
                     device_name = "DirectML"
-                    logger.info("Using DirectML device for GPU acceleration")
+                    logger.info("Using DirectML device for GPU acceleration (DTOCR_OCR_DEVICE=directml)")
                 except Exception as exc:
-                    logger.info("DirectML unavailable: %s", exc)
+                    logger.warning("DTOCR_OCR_DEVICE=directml requested, but DirectML is unavailable: %s", exc)
+
+            if device is None and requested_device == "auto":
+                try:
+                    import importlib.util
+
+                    if importlib.util.find_spec("torch_directml") is not None:
+                        logger.info(
+                            "torch_directml is installed but disabled in auto mode. "
+                            "Set DTOCR_OCR_DEVICE=directml to enable it."
+                        )
+                except Exception:
+                    pass
 
             if device is None:
                 device = torch.device("cpu")
@@ -279,7 +304,7 @@ class OCRPipeline:
             model = VisionEncoderDecoderModel.from_pretrained(
                 model_name,
                 low_cpu_mem_usage=False,
-                torch_dtype=torch.float32,
+                dtype=torch.float32,
             )
             bad = [n for n, p in model.named_parameters() if p.device.type == "meta"]
             if bad:
