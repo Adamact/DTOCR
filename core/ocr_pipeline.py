@@ -253,9 +253,7 @@ class OCRPipeline:
                 )
                 requested_device = "auto"
 
-            # Device selection
-            # Default ('auto') prefers CUDA, then CPU. DirectML is opt-in via DTOCR_OCR_DEVICE=directml
-            # because some hosts produce poor OCR quality with TrOCR on DirectML.
+            # Device selection: auto prefers CUDA, then DirectML, then CPU.
             device = None
             device_name = "cpu"
             if requested_device in {"auto", "cuda"}:
@@ -269,7 +267,7 @@ class OCRPipeline:
                 except Exception as exc:
                     logger.info("CUDA check failed: %s", exc)
 
-            if device is None and requested_device == "directml":
+            if device is None and requested_device in {"auto", "directml"}:
                 try:
                     import torch_directml  # type: ignore
 
@@ -278,21 +276,10 @@ class OCRPipeline:
                     _ = torch.zeros(1, device=dml_device)
                     device = dml_device
                     device_name = "DirectML"
-                    logger.info("Using DirectML device for GPU acceleration (DTOCR_OCR_DEVICE=directml)")
+                    logger.info("Using DirectML device for GPU acceleration")
                 except Exception as exc:
-                    logger.warning("DTOCR_OCR_DEVICE=directml requested, but DirectML is unavailable: %s", exc)
-
-            if device is None and requested_device == "auto":
-                try:
-                    import importlib.util
-
-                    if importlib.util.find_spec("torch_directml") is not None:
-                        logger.info(
-                            "torch_directml is installed but disabled in auto mode. "
-                            "Set DTOCR_OCR_DEVICE=directml to enable it."
-                        )
-                except Exception:
-                    pass
+                    if requested_device == "directml":
+                        logger.warning("DTOCR_OCR_DEVICE=directml requested, but DirectML is unavailable: %s", exc)
 
             if device is None:
                 device = torch.device("cpu")
