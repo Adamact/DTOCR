@@ -60,27 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reject client names, personal paths and committed databases
-        run: |
-          set -e
-          fail=0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-          # Client / organisation names that must never re-enter the codebase.
-          if git grep -nEi '\b(layout-b|layout-a|layout-c)\b' -- . ':!.github/workflows/ci.yml'; then
-            echo "::error::A client or organisation name was found in the source tree."
-            fail=1
-          fi
-
-          # Absolute local paths leak usernames and real document locations.
-          if git grep -nE '[A-Za-z]:[\\/]Users[\\/]|/home/[a-z]+/|/Users/[a-z]+/' -- . ':!.github/workflows/ci.yml'; then
-            echo "::error::An absolute local filesystem path was found."
-            fail=1
-          fi
-
-          # Template payloads embed absolute source-PDF paths; never commit the DB.
-          if git ls-files | grep -E '\.sqlite3?$'; then
-            echo "::error::A database file is tracked in git."
-            fail=1
-          fi
-
-          exit $fail
+      - name: Reject local paths, tracked databases and secret files
+        # Structural checks only. Customer and project names belong in a local
+        # .privacy-denylist, which is gitignored so the terms never ship here.
+        run: python scripts/privacy_check.py

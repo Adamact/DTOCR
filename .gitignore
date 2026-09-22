@@ -42,3 +42,6 @@ data/vendor_configs/
 
 # Tooling
 .omc/
+
+# Local privacy denylist (customer/project names) - never commit
+.privacy-denylist
