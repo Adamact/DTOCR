@@ -4,7 +4,12 @@ Turn scanned or digital PDFs of tabular documents — invoices, delivery notes, 
 
 You draw regions once on a sample PDF, DTOCR saves that as a reusable **template**, and every later document of the same shape is rendered, OCR'd, parsed into rows, and exported to Excel. Table regions get an automatic row/column grid so each cell is read individually instead of as one blob of text.
 
-> **Status:** working prototype. The desktop app is the supported path; the HTTP API and worker are an early headless variant of the same pipeline.
+> **Status:** working prototype, and the proof of concept behind what is today **Attestro**.
+> This repository is the original exploration that the product grew out of; it is kept public
+> as a reference implementation rather than as the maintained product.
+>
+> The desktop app is the supported path here; the HTTP API and worker are an early headless
+> variant of the same pipeline.
 
 ---
 
