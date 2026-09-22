@@ -39,7 +39,7 @@ def demo_column_caching():
         
         if cached_cols is None:
             # Auto-detect columns
-            print(f"  Action: AUTO-DETECT columns")
+            print("  Action: AUTO-DETECT columns")
             
             # Simulate column detection on first row
             if page_num == 1:
@@ -47,14 +47,14 @@ def demo_column_caching():
                 detected_cols = [0, 150, 300, 500]  # x-coordinates
                 col_boundaries_cache[region_label] = detected_cols
                 print(f"  Detected column boundaries: {detected_cols}")
-                print(f"  Cached for future pages")
+                print("  Cached for future pages")
             
             # Rows would still be auto-detected (adaptive per page)
-            print(f"  Rows: AUTO-DETECTED (adaptive to this page)")
+            print("  Rows: AUTO-DETECTED (adaptive to this page)")
         else:
             # Use cached columns
             print(f"  Action: USE CACHED columns: {cached_cols}")
-            print(f"  Rows: AUTO-DETECTED (adaptive to this page)")
+            print("  Rows: AUTO-DETECTED (adaptive to this page)")
         
         print()
     

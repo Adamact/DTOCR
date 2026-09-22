@@ -12,7 +12,6 @@ import argparse
 import logging
 import tempfile
 from pathlib import Path
-import sys
 
 from DTOCR.core.logging import configure_logging
 from DTOCR.services.template_service import TemplateService
@@ -28,7 +27,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     configure_logging(logging.DEBUG)
-    logger = logging.getLogger(__name__)
 
     img_path = Path(args.image)
     if not img_path.exists():

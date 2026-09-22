@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
 import copy
 import logging
-
+from typing import Any
 
 DEFAULT_DETECTION_SETTINGS: dict[str, Any] = {
     "row": {
@@ -84,7 +83,7 @@ def auto_detect_grid_structure(image_path: str, label: str, detection_settings: 
     logger = logging.getLogger(__name__)
     try:
         import cv2  # type: ignore
-        import numpy as np  # type: ignore
+        import numpy as np  # type: ignore  # noqa: F401
     except Exception as exc:
         logger.warning("OpenCV or numpy not available for auto grid detection: %s", exc)
         return None
@@ -220,7 +219,7 @@ def _find_row_boundaries(binary: Any, h_img: int, w_img: int, settings: dict[str
     # Boundaries are placed in the middle of gaps for padding on both sides
     boundaries = [0]
     
-    for i, (content_start, content_end) in enumerate(content_regions):
+    for i, (content_start, _content_end) in enumerate(content_regions):
         # Calculate where this row should start:
         # Either at the start, or in the middle of the gap above this content
         if i == 0:
@@ -329,7 +328,7 @@ def _detect_grid_from_content(img: Any, h_img: int, w_img: int, logger: Any, set
     """Fallback: detect grid from content using morphological operations."""
     try:
         import cv2  # type: ignore
-        import numpy as np  # type: ignore
+        import numpy as np  # type: ignore  # noqa: F401
     except Exception:
         return None
     

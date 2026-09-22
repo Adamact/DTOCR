@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from DTOCR.db.sqlite import Database  # type: ignore
 from DTOCR.db.repositories import TemplateRepository  # type: ignore
+from DTOCR.db.sqlite import Database  # type: ignore
 from DTOCR.services.template_service import TemplateService  # type: ignore
 
 

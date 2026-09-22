@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable
+import io
+import logging
 import re
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-import io
+from typing import Any
 
-from DTOCR.db.repositories import TemplateRepository # type: ignore
-from DTOCR.core.pdf_renderer import PdfDocument, PdfPage, PdfRect, scale_from_dpi
-import logging
-from DTOCR.core.ocr_pipeline import OCRPipeline
 from DTOCR.core.grid_detector import merge_detection_settings
+from DTOCR.core.ocr_pipeline import OCRPipeline
+from DTOCR.core.pdf_renderer import PdfDocument, PdfPage, PdfRect, scale_from_dpi
+from DTOCR.db.repositories import TemplateRepository  # type: ignore
 
 
 @dataclass
@@ -532,18 +533,14 @@ class TemplateService:
                 logger.info("Auto-detected %d rows for grid '%s' on page %d (template had %d rows) - image size: %dx%d", 
                            len(row_boxes), label, page_number, len(rows), w_img, h_img)
                 logger.debug("Row boxes for page %d: %s", page_number, row_boxes[:5])  # Log first 5 rows
-                # Use detected rows
-                detected_rows = len(row_boxes)
             else:
                 # Fallback to template rows if detection fails
                 logger.warning("Row detection found no rows for grid '%s' page %d, using template rows", label, page_number)
                 row_boxes = None
-                detected_rows = len(rows)
         except Exception as exc:
             logger.warning("Could not auto-detect rows for grid '%s' page %d: %s, using template rows", 
                           label, page_number, exc)
             row_boxes = None
-            detected_rows = len(rows)
             h_img = img_h
             w_img = img_w
 
@@ -555,7 +552,7 @@ class TemplateService:
             # Use detected row positions (adaptive)
             logger.info("Using %d detected rows with template columns for page %d", len(row_boxes), page_number)
             crops: list[dict[str, Any]] = []
-            for row_idx, (rx, ry, rw, rh) in enumerate(row_boxes):
+            for row_idx, (_rx, ry, _rw, rh) in enumerate(row_boxes):
                 for col_idx, col_ratio in enumerate(col_ratios):
                     x_offset_px = sum(col_ratios[:col_idx]) * w_img
                     cell_width_px = col_ratio * w_img
@@ -659,7 +656,7 @@ class TemplateService:
         logger = logging.getLogger(__name__)
         try:
             import cv2  # type: ignore
-            import numpy as np  # type: ignore
+            import numpy as np  # type: ignore  # noqa: F401
         except Exception as exc:
             logger.warning("OpenCV or numpy not available, skipping data_field splitting: %s", exc)
             return []

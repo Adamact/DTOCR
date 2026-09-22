@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+
 from DTOCR.web.api.routes.documents import router as documents_router  # type: ignore
 from DTOCR.web.api.routes.runs import router as runs_router  # type: ignore
 

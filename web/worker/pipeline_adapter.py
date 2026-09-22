@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from DTOCR.services.service_factory import create_template_service  # type: ignore
 
@@ -8,8 +8,8 @@ from DTOCR.services.service_factory import create_template_service  # type: igno
 def run_pipeline(
     template_payload: dict[str, Any],
     pdf_path: str,
-    excel_path: Optional[str] = None,
-    word_kernel_divisor: Optional[int] = None,
+    excel_path: str | None = None,
+    word_kernel_divisor: int | None = None,
     save_crops: bool = True,
     batch_size: int = 8,
     num_beams: int = 1,

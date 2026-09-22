@@ -154,12 +154,31 @@ web/        FastAPI app and RQ worker (headless path)
 scripts/    development and benchmarking utilities
 ```
 
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+python -m pytest tests -q     # from the directory above the checkout: python -m pytest DTOCR/tests -q
+ruff check .
+python scripts/privacy_check.py
+```
+
+`scripts/privacy_check.py` fails if an absolute local path, a database file, or a
+key/env file is tracked. It also reads optional terms from `.privacy-denylist`
+(gitignored) so names that should never be committed can be checked without
+writing them into the repository.
+
 ## Known limitations
 
 - The desktop GUI is Tkinter — functional, not pretty.
 - `trocr-base-printed` targets printed text; handwriting needs a different checkpoint.
 - Grid detection assumes whitespace-separated tables; heavily ruled or shaded tables may need manual boundaries.
-- There is no automated test suite yet — `scripts/` holds manual verification helpers.
+- Layout A reads quantity as the first number on the item line, so digits inside a
+  product name (`Crushed stone 0-32`) are picked up instead of the real quantity.
+- Layout A stops a `key: value` field at the first `;`, so trailing fields on the
+  same line (a contact name after a site) are not captured.
+- Only the parsers are covered by tests; the GUI and OCR pipeline are verified manually.
 
 ## License
 

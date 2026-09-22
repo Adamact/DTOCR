@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Literal
-from uuid import uuid4
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
 
 @dataclass
@@ -12,8 +12,8 @@ class RunRecord:
     template_id: int
     pdf_path: str
     status: Literal["queued", "running", "done", "failed"] = "queued"
-    result_path: Optional[str] = None
-    error: Optional[str] = None
+    result_path: str | None = None
+    error: str | None = None
 
 
 RUNS: dict[str, RunRecord] = {}

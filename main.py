@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from DTOCR.core.logging import configure_logging # type: ignore
+from DTOCR.core.logging import configure_logging  # type: ignore
+from DTOCR.gui.app import App  # type: ignore
 from DTOCR.services.service_factory import create_template_service  # type: ignore
-from DTOCR.gui.app import App # type: ignore
 
 
 def main() -> None:

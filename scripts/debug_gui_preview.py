@@ -1,10 +1,11 @@
 """Create App instance and call _on_preview programmatically using a generated image."""
-from pathlib import Path
-import tempfile
 import sys
+import tempfile
+from pathlib import Path
 
 # ensure parent of project root is on sys.path
 from pathlib import Path as _P
+
 sys.path.insert(0, str(_P(__file__).resolve().parents[2]))
 
 try:
@@ -13,8 +14,8 @@ except Exception:
     print('Pillow missing; install Pillow to test GUI preview')
     raise
 
-from DTOCR.services.template_service import TemplateService
 from DTOCR.gui.app import App
+from DTOCR.services.template_service import TemplateService
 
 # create test image
 img = Image.new('RGB', (800, 300), color='white')
@@ -49,6 +50,7 @@ except Exception as e:
 
 # keep the app window open for a few seconds so user can see it, then exit
 import time
+
 print('Sleeping 5 seconds to allow GUI to paint...')
 time.sleep(5)
 app.root.destroy()

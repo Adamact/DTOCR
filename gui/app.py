@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
-from DTOCR.services.template_service import TemplateService
-from DTOCR.parsers.registry import available_parsers
 from DTOCR.gui.template_editor import TemplateEditor
+from DTOCR.parsers.registry import available_parsers
+from DTOCR.services.template_service import TemplateService
 
 # PIL is optional (for annotated image viewer). If missing, the viewer falls back to telling user where images were saved.
 try:
@@ -16,16 +16,16 @@ except Exception:
     ImageTk = None
 
 # pypdfium2 is optional and used to render PDF pages for preview
-from DTOCR.core.pdf_renderer import PdfDocument
-
 import glob
-import os
-import tempfile
-import shutil
 import logging
-import threading
+import os
 import queue
+import shutil
+import tempfile
+import threading
 from pathlib import Path
+
+from DTOCR.core.pdf_renderer import PdfDocument
 
 
 class App:
@@ -36,7 +36,7 @@ class App:
         self.root.title("OCR App (MVP Skeleton)")
         self.root.geometry("700x600")
 
-        self._ocr_queue: "queue.Queue[tuple[str, object, object | None]]" = queue.Queue()
+        self._ocr_queue: queue.Queue[tuple[str, object, object | None]] = queue.Queue()
         self._ocr_running = False
         self.run_ocr_button: ttk.Button | None = None
         self.ocr_status_var = tk.StringVar(value="")
@@ -682,7 +682,7 @@ class App:
             
             try:
                 # Apply the template to see the grid structure overlaid
-                result = self.template_service.apply_template_to_pdf(payload, source_path if not self.preview_is_pdf else source_path, word_kernel_divisor=divisor, save_crops=True)
+                self.template_service.apply_template_to_pdf(payload, source_path if not self.preview_is_pdf else source_path, word_kernel_divisor=divisor, save_crops=True)
                 
                 # Look for an annotated image showing the grid applied
                 annotated_dir = Path(outdir) / "annotated"

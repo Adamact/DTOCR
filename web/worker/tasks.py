@@ -38,7 +38,7 @@ def process_run(run_payload_path: str, result_path: str) -> None:
 
 
 def _read_json(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 

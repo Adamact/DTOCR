@@ -5,9 +5,10 @@ Usage: python scripts/debug_preview.py
 from __future__ import annotations
 
 import logging
+import sys
 import tempfile
 from pathlib import Path
-import sys
+
 # Ensure project root is importable when running the script directly
 # Insert the parent directory of project root so 'DTOCR' package dir is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -17,8 +18,8 @@ try:
 except Exception:
     Image = None
 
-from DTOCR.services.template_service import TemplateService
 from DTOCR.core.logging import configure_logging
+from DTOCR.services.template_service import TemplateService
 
 
 def main() -> int:

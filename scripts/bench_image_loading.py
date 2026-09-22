@@ -4,9 +4,10 @@ Usage:
     python scripts/bench_image_loading.py --count 200 --workers 8
 """
 import argparse
+import io
 import time
 from concurrent.futures import ThreadPoolExecutor
-import io
+
 from PIL import Image
 
 # Create a sample RGB image in memory

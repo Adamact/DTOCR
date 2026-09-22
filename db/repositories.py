@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
-from DTOCR.db.sqlite import Database # type: ignore
+from DTOCR.db.sqlite import Database  # type: ignore
 
 
 def _utc_now_iso() -> str:
@@ -57,7 +57,7 @@ class TemplateRepository:
             conn.commit()
             return int(cur.lastrowid)
 
-    def get_latest_version_payload(self, template_id: int) -> Optional[dict[str, Any]]:
+    def get_latest_version_payload(self, template_id: int) -> dict[str, Any] | None:
         with self.db.connect() as conn:
             row = conn.execute(
                 """

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from pathlib import Path
-from fastapi import Query
 
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from DTOCR.services.service_factory import create_template_service  # type: ignore
-from DTOCR.web.worker.pipeline_adapter import run_pipeline  # type: ignore
 from DTOCR.web.api.run_store import RUNS, RunRecord, new_run_id, result_path_for  # type: ignore
+from DTOCR.web.worker.pipeline_adapter import run_pipeline  # type: ignore
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -78,14 +77,14 @@ def get_results(run_id: str) -> dict:
     r = RUNS[run_id]
     if not r.result_path:
         raise HTTPException(status_code=409, detail="Results not ready")
-    with open(r.result_path, "r", encoding="utf-8") as f:
+    with open(r.result_path, encoding="utf-8") as f:
         return json.load(f)
     
 def _load_result_from_disk(run_id: str) -> dict:
     disk_path = result_path_for(run_id)
     if not Path(disk_path).exists():
         raise HTTPException(status_code=404, detail="Run not found")
-    with open(disk_path, "r", encoding="utf-8") as f:
+    with open(disk_path, encoding="utf-8") as f:
         return json.load(f)
 
 @router.get("/{run_id}/summary")

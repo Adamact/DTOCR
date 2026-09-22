@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import json
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from PIL import Image
 
@@ -28,8 +29,9 @@ class OCRPipeline:
     ) -> dict[str, Any]:
         import logging
         import sys
-        import torch  # type: ignore
         from concurrent.futures import ThreadPoolExecutor
+
+        import torch  # type: ignore
 
         logger = logging.getLogger(__name__)
 
@@ -233,6 +235,7 @@ class OCRPipeline:
     def _require_trocr(self):
         try:
             import os
+
             import torch  # type: ignore
             from transformers import TrOCRProcessor, VisionEncoderDecoderModel  # type: ignore
         except Exception as exc:

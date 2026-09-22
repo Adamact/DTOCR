@@ -38,22 +38,14 @@ jobs:
       - name: Byte-compile all sources
         run: python -m compileall -q core db gui parsers services shared web scripts
 
-      - name: Parser unit checks
-        # The parsers depend only on the standard library, so they can be
-        # exercised without installing torch or the other heavy runtime deps.
-        run: |
-          cd ..
-          python -c "
-          from DTOCR.parsers.registry import available_parsers, get_parser
-          from DTOCR.parsers import vendor_parsers as vp
-          assert available_parsers() == ['grid-only', 'layout-a', 'layout-b'], available_parsers()
-          rows = [['1', 'Item', '2', 'ton', '10.00', '20.00'], ['Delivery date: 2026-01-01'], ['Bilregnr: ab123']]
-          recs, carry = vp.parse_structured_rows_layout_a_with_carry(rows, None)
-          assert carry and carry['vehicle_id'] == 'AB123', carry
-          recs, carry = vp.parse_structured_rows_layout_b_with_carry([['Belopp SEK'], ['1 02-14 ABC12 Sand ton 2,0 50,00 100,00']], None)
-          assert carry and carry['vehicle_id'] == 'ABC12', carry
-          print('parser checks OK')
-          "
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run tests
+        # The parsers depend only on the standard library, so the suite runs
+        # without torch, OpenCV or the other heavy runtime dependencies.
+        # Tests import `DTOCR.*`, so run from the directory above the checkout.
+        run: cd .. && python -m pytest DTOCR/tests -q
 
   privacy-guard:
     runs-on: ubuntu-latest

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import tkinter as tk
 from dataclasses import dataclass
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
 from uuid import uuid4
 
-import tkinter as tk
 from PIL import Image, ImageTk
-from tkinter import filedialog, messagebox, ttk
 
-from DTOCR.services.template_service import TemplateService
 from DTOCR.core.grid_detector import auto_detect_grid_structure, default_detection_settings, merge_detection_settings
 from DTOCR.core.pdf_renderer import PdfDocument, PdfRect, scale_from_dpi
 from DTOCR.parsers.registry import available_parsers, get_parser
+from DTOCR.services.template_service import TemplateService
 
 
 @dataclass
@@ -935,7 +935,7 @@ class TemplateEditor:
             self.canvas.create_line(x1, y_cursor, x2, y_cursor, fill="#66bb6a", width=1)
 
         x_cursor = x1
-        for idx, ratio in enumerate(col_ratios[:-1]):
+        for _idx, ratio in enumerate(col_ratios[:-1]):
             x_cursor += width * ratio
             self.canvas.create_line(x_cursor, y1, x_cursor, y2, fill="#66bb6a", width=1)
 
@@ -1244,7 +1244,7 @@ class TemplateEditor:
     def _normalize_ratio_list(self, items: list[dict[str, Any]], key: str) -> None:
         ratios = [float(item.get(key, 0.0)) for item in items]
         normed = self._normalize_ratios(ratios)
-        for item, ratio in zip(items, normed):
+        for item, ratio in zip(items, normed, strict=False):
             item[key] = ratio
 
     def _toggle_grid_mode(self) -> None:
@@ -1351,7 +1351,7 @@ class TemplateEditor:
         # Create an entry widget on the canvas
         entry_var = tk.StringVar(value=current_label)
         entry = tk.Entry(self.canvas, textvariable=entry_var, font=("TkDefaultFont", 8), width=15)
-        entry_window = self.canvas.create_window(
+        self.canvas.create_window(
             (bbox[0] + bbox[2]) / 2,
             (bbox[1] + bbox[3]) / 2,
             window=entry,

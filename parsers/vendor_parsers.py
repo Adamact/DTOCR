@@ -11,9 +11,9 @@ issuer. To support a new document format, add a parser here and register it in
 
 from __future__ import annotations
 
-from typing import Any
 import re
 import unicodedata
+from typing import Any
 
 
 def parse_structured_rows(rows: list[list[str]]) -> list[dict[str, Any]]:
@@ -176,11 +176,11 @@ def parse_structured_rows_layout_b_with_carry(
     """
 
     def _extract_numbers(line: str) -> list[str]:
-        return re.findall(r"\d{1,3}(?:[  ]\d{3})*(?:,\d+)?", line)
+        return re.findall(r"\d{1,3}(?:[ \u00A0]\d{3})*(?:,\d+)?", line)
 
     def _parse_decimal(value: str) -> float | None:
         """Parse a number written with space thousands separators and a decimal comma."""
-        cleaned = value.replace(" ", " ").replace(" ", "")
+        cleaned = value.replace("\u00A0", " ").replace(" ", "")
         cleaned = cleaned.replace(",", ".")
         try:
             return float(cleaned)

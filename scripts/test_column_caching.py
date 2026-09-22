@@ -11,10 +11,8 @@ This script:
    - Rows remain page-adaptive
 """
 
-import json
 import sys
 from pathlib import Path
-import tempfile
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -22,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 def test_column_caching():
     """Test that column structure is cached from page 1 and reused on page 2."""
     try:
-        from DTOCR.services.template_service import TemplateService
         from DTOCR.core.test_utils import create_test_pdf_with_table
+        from DTOCR.services.template_service import TemplateService
     except ImportError:
         print("Warning: Could not import test utilities. Skipping test.")
         print("This is expected in production environments without test modules.")
