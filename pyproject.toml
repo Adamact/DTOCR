@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dtocr"
+version = "0.1.0"
+description = "Template-driven OCR that turns tabular PDFs into structured spreadsheets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Adam Älgamo" }]
+keywords = ["ocr", "pdf", "trocr", "table-extraction", "invoice", "document-parsing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Text Processing",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
+    "pillow>=10.0",
+    "pypdfium2>=4.20",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "transformers>=4.35",
+    "sentencepiece>=0.1.99",
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.0",
+    "redis>=5.0",
+    "rq>=1.15",
+    "python-multipart>=0.0.9",
+]
+directml = ["torch-directml"]
+dev = ["ruff>=0.6", "pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/Adamact/DTOCR"
+Issues = "https://github.com/Adamact/DTOCR/issues"
+
+[project.scripts]
+dtocr = "DTOCR.main:main"
+
+[tool.setuptools]
+# The repository root is itself the `DTOCR` package, so map it explicitly
+# rather than auto-discovering (which would expose `core`, `db`, ... as
+# top-level packages and collide with other installs).
+package-dir = { "DTOCR" = "." }
+packages = [
+    "DTOCR",
+    "DTOCR.core",
+    "DTOCR.db",
+    "DTOCR.gui",
+    "DTOCR.parsers",
+    "DTOCR.services",
+    "DTOCR.shared",
+    "DTOCR.shared.schemas",
+    "DTOCR.web",
+    "DTOCR.web.api",
+    "DTOCR.web.api.routes",
+    "DTOCR.web.worker",
+]
+
+[tool.setuptools.package-data]
+"DTOCR.db" = ["*.sql"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

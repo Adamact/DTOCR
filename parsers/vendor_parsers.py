@@ -1,3 +1,14 @@
+"""Line-item parsers for the tabular document layouts DTOCR ships with.
+
+Each layout parser turns OCR'd rows into structured records. Parsers are
+stateful across pages: they accept and return a ``carry`` record so a line item
+split across a page break is stitched back together by the caller.
+
+Layouts are named ``layout_a`` / ``layout_b`` rather than after any particular
+issuer. To support a new document format, add a parser here and register it in
+:mod:`DTOCR.parsers.registry`.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -6,15 +17,22 @@ import unicodedata
 
 
 def parse_structured_rows(rows: list[list[str]]) -> list[dict[str, Any]]:
-    records, carry = parse_structured_rows_with_carry(rows, None)
+    """Parse ``rows`` with the layout A parser, flushing any trailing record."""
+    records, carry = parse_structured_rows_layout_a_with_carry(rows, None)
     if carry:
         records.append(carry)
     return records
 
 
-def parse_structured_rows_with_carry(
+def parse_structured_rows_layout_a_with_carry(
     rows: list[list[str]], carry: dict[str, Any] | None
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Parse a keyed layout: a numbered item line followed by ``key: value`` lines.
+
+    Returns the completed records plus a trailing in-progress record (or
+    ``None``), which the caller feeds back in as ``carry`` for the next page.
+    """
+
     def _normalize_line(line: str) -> str:
         normalized = unicodedata.normalize("NFKD", line)
         normalized = normalized.encode("ascii", "ignore").decode("ascii")
@@ -49,7 +67,7 @@ def parse_structured_rows_with_carry(
         return bool(re.fullmatch(r"[A-Z]{1,3}-?\d{2,6}", token.strip()))
 
     def _is_complete(record: dict[str, Any]) -> bool:
-        required = ["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"]
+        required = ["delivery_date", "vehicle_id", "description", "qty", "unit_price", "amount"]
         return all(record.get(field) not in (None, "") for field in required)
 
     records: list[dict[str, Any]] = []
@@ -60,6 +78,7 @@ def parse_structured_rows_with_carry(
         if not any(cells):
             continue
 
+        # A leading integer starts a new line item; flush the previous one.
         if cells[0].isdigit():
             if current:
                 records.append(current)
@@ -74,12 +93,12 @@ def parse_structured_rows_with_carry(
                 "delivery_date": None,
                 "delivery_note": None,
                 "buyer_order_id": None,
-                "u_stalle": None,
+                "site": None,
                 "contact": None,
                 "phone": None,
-                "vagsedel": None,
-                "bilregnr": None,
-                "avfallsdeklaration": None,
+                "waybill": None,
+                "vehicle_id": None,
+                "waste_declaration": None,
             }
             _extract_qty_price_amount(" ".join(cells[1:]), current)
             continue
@@ -118,7 +137,7 @@ def parse_structured_rows_with_carry(
             if val:
                 parts = [p.strip() for p in val.split(";") if p.strip()]
                 if parts:
-                    current["u_stalle"] = parts[0]
+                    current["site"] = parts[0]
                 if len(parts) > 1:
                     current["contact"] = parts[1]
             continue
@@ -127,14 +146,15 @@ def parse_structured_rows_with_carry(
         if phone_match and not current.get("phone"):
             current["phone"] = phone_match.group(0)
 
+        # Document keys on the left, record fields on the right.
         for key, target in [
-            ("vagsedel", "vagsedel"),
-            ("bilregnr", "bilregnr"),
-            ("avfallsdeklaration", "avfallsdeklaration"),
+            ("vagsedel", "waybill"),
+            ("bilregnr", "vehicle_id"),
+            ("avfallsdeklaration", "waste_declaration"),
         ]:
             val = _extract_after_key(normalized, key)
             if val:
-                current[target] = val.upper() if target == "bilregnr" else val
+                current[target] = val.upper() if target == "vehicle_id" else val
 
         _extract_qty_price_amount(line, current)
 
@@ -149,30 +169,37 @@ def parse_structured_rows_with_carry(
 def parse_structured_rows_layout_b_with_carry(
     rows: list[list[str]], carry: dict[str, Any] | None
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    def _extract_numbers(line: str) -> list[str]:
-        return re.findall(r"\d{1,3}(?:[ \u00A0]\d{3})*(?:,\d+)?", line)
+    """Parse a positional layout: one line item per row, plus trailing surcharge rows.
 
-    def _parse_number_sv(value: str) -> float | None:
-        cleaned = value.replace("\u00A0", " ").replace(" ", "")
+    Surcharge rows carry no identity of their own, so their amounts are folded
+    into the most recent line item that has both a vehicle id and a date.
+    """
+
+    def _extract_numbers(line: str) -> list[str]:
+        return re.findall(r"\d{1,3}(?:[  ]\d{3})*(?:,\d+)?", line)
+
+    def _parse_decimal(value: str) -> float | None:
+        """Parse a number written with space thousands separators and a decimal comma."""
+        cleaned = value.replace(" ", " ").replace(" ", "")
         cleaned = cleaned.replace(",", ".")
         try:
             return float(cleaned)
         except ValueError:
             return None
 
-    def _is_fee_line(line: str) -> bool:
+    def _is_surcharge_a_line(line: str) -> bool:
         lowered = line.lower()
-        return "t\u00e4kt" in lowered and "milj\u00f6" in lowered
+        return "täkt" in lowered and "miljö" in lowered
 
-    def _is_winter_line(line: str) -> bool:
+    def _is_surcharge_b_line(line: str) -> bool:
         lowered = line.lower()
-        return "vintertill\u00e4gg" in lowered or "vintertillagg" in lowered
+        return "vintertillägg" in lowered or "vintertillagg" in lowered
 
     def _extract_unit(line: str) -> str | None:
         match = re.search(r"\b(ton|kg|m3|m2|st)\b", line.lower())
         return match.group(1) if match else None
 
-    def _extract_bilnr(tokens: list[str], start_idx: int) -> tuple[str | None, int | None]:
+    def _extract_vehicle_id(tokens: list[str], start_idx: int) -> tuple[str | None, int | None]:
         for idx in range(start_idx, len(tokens)):
             token = tokens[idx].strip().upper()
             if token in {"N", "-"}:
@@ -185,71 +212,72 @@ def parse_structured_rows_layout_b_with_carry(
         tokens = [t for t in line.split() if t.strip()]
         if not tokens:
             return None
-        foljesedel = None
+        delivery_note = None
         if tokens[0].isdigit():
-            foljesedel = tokens[0]
+            delivery_note = tokens[0]
 
-        levdag_match = re.search(r"\b\d{2}-\d{2}\b", line)
-        levdag = levdag_match.group(0) if levdag_match else None
-        levdag_idx = tokens.index(levdag) if levdag and levdag in tokens else 0
-        bilnr, bilnr_idx = _extract_bilnr(tokens, levdag_idx + 1)
-        if bilnr:
-            bilnr = bilnr.upper()
+        date_match = re.search(r"\b\d{2}-\d{2}\b", line)
+        delivery_date = date_match.group(0) if date_match else None
+        date_idx = tokens.index(delivery_date) if delivery_date and delivery_date in tokens else 0
+        vehicle_id, vehicle_idx = _extract_vehicle_id(tokens, date_idx + 1)
+        if vehicle_id:
+            vehicle_id = vehicle_id.upper()
 
         unit = _extract_unit(line)
         unit_idx = tokens.index(unit) if unit and unit in tokens else None
         ton_idx = None
         for idx, token in enumerate(tokens):
-            if idx <= (bilnr_idx or -1):
+            if idx <= (vehicle_idx or -1):
                 continue
             if token.strip().lower() == "ton":
                 ton_idx = idx
                 break
 
-        if bilnr_idx is not None:
-            if ton_idx is not None and ton_idx > bilnr_idx:
+        # The product name is whatever sits between the vehicle id and the unit.
+        if vehicle_idx is not None:
+            if ton_idx is not None and ton_idx > vehicle_idx:
                 end_idx = ton_idx
             else:
-                end_idx = unit_idx if unit_idx is not None and unit_idx > bilnr_idx else len(tokens)
-            produkt_tokens = tokens[bilnr_idx + 1 : end_idx]
+                end_idx = unit_idx if unit_idx is not None and unit_idx > vehicle_idx else len(tokens)
+            product_tokens = tokens[vehicle_idx + 1 : end_idx]
         elif ton_idx is not None:
-            start_idx = levdag_idx + 1
+            start_idx = date_idx + 1
             if start_idx < len(tokens) and tokens[start_idx].strip().upper() == "N":
                 start_idx += 1
-            produkt_tokens = tokens[start_idx:ton_idx]
+            product_tokens = tokens[start_idx:ton_idx]
         else:
-            produkt_tokens = []
-        produktnamn = " ".join(produkt_tokens).strip() if produkt_tokens else None
+            product_tokens = []
+        product_name = " ".join(product_tokens).strip() if product_tokens else None
 
         numbers = _extract_numbers(line)
         qty = unit_price = amount = None
         if len(numbers) >= 3:
-            qty = _parse_number_sv(numbers[-3])
-            unit_price = _parse_number_sv(numbers[-2])
-            amount = _parse_number_sv(numbers[-1])
+            qty = _parse_decimal(numbers[-3])
+            unit_price = _parse_decimal(numbers[-2])
+            amount = _parse_decimal(numbers[-1])
 
         return {
-            "foljesedel": foljesedel,
-            "levdag": levdag,
-            "bilnr": bilnr,
-            "produktnamn": produktnamn,
-            "enhet": unit,
-            "kvantitet": qty,
-            "a_pris": unit_price,
-            "belopp_sek": amount,
-            "takt_miljoavgift": False,
-            "vintertillagg": False,
+            "delivery_note": delivery_note,
+            "delivery_date": delivery_date,
+            "vehicle_id": vehicle_id,
+            "product_name": product_name,
+            "unit": unit,
+            "quantity": qty,
+            "unit_price": unit_price,
+            "amount": amount,
+            "surcharge_a": False,
+            "surcharge_b": False,
         }
 
     records: list[dict[str, Any]] = []
     current: dict[str, Any] | None = carry
 
-    def _is_fee_target(row: dict[str, Any] | None) -> bool:
+    def _is_surcharge_target(row: dict[str, Any] | None) -> bool:
         if not row:
             return False
-        return bool(str(row.get("bilnr", "")).strip()) and bool(str(row.get("levdag", "")).strip())
+        return bool(str(row.get("vehicle_id", "")).strip()) and bool(str(row.get("delivery_date", "")).strip())
 
-    last_fee_target: dict[str, Any] | None = current if _is_fee_target(current) else None
+    last_surcharge_target: dict[str, Any] | None = current if _is_surcharge_target(current) else None
 
     started = bool(carry)
     for row in rows:
@@ -260,30 +288,28 @@ def parse_structured_rows_layout_b_with_carry(
         lower_line = line.lower()
         if "sammandrag faktura" in lower_line:
             break
-        is_takt_line = _is_fee_line(line)
-        is_winter_line = _is_winter_line(line)
-        if (is_takt_line or is_winter_line) and last_fee_target:
+        is_surcharge_a = _is_surcharge_a_line(line)
+        is_surcharge_b = _is_surcharge_b_line(line)
+        if (is_surcharge_a or is_surcharge_b) and last_surcharge_target:
             numbers = _extract_numbers(line)
-            if len(numbers) >= 3:
-                fee_unit_price = _parse_number_sv(numbers[-2])
-                fee_amount = _parse_number_sv(numbers[-1])
-            elif len(numbers) >= 2:
-                fee_unit_price = _parse_number_sv(numbers[-2])
-                fee_amount = _parse_number_sv(numbers[-1])
+            if len(numbers) >= 2:
+                surcharge_unit_price = _parse_decimal(numbers[-2])
+                surcharge_amount = _parse_decimal(numbers[-1])
             else:
-                fee_unit_price = None
-                fee_amount = None
-            target = last_fee_target
-            flag_key = "takt_miljoavgift" if is_takt_line else "vintertillagg"
+                surcharge_unit_price = None
+                surcharge_amount = None
+            target = last_surcharge_target
+            flag_key = "surcharge_a" if is_surcharge_a else "surcharge_b"
             if flag_key not in target:
                 target[flag_key] = False
-            if fee_unit_price is not None:
-                target["a_pris"] = (target.get("a_pris") or 0) + fee_unit_price
-            if fee_amount is not None:
-                target["belopp_sek"] = (target.get("belopp_sek") or 0) + fee_amount
+            if surcharge_unit_price is not None:
+                target["unit_price"] = (target.get("unit_price") or 0) + surcharge_unit_price
+            if surcharge_amount is not None:
+                target["amount"] = (target.get("amount") or 0) + surcharge_amount
             target[flag_key] = True
             continue
 
+        # Skip the header block until the amount column is seen.
         if not started:
             if "belopp sek" in lower_line:
                 started = True
@@ -295,13 +321,14 @@ def parse_structured_rows_layout_b_with_carry(
         if current:
             records.append(current)
         current = parsed
-        if _is_fee_target(parsed):
-            last_fee_target = parsed
+        if _is_surcharge_target(parsed):
+            last_surcharge_target = parsed
 
     return records, current
 
 
 def parse_grid_cells(grid_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten detected grid cells into one record per cell."""
     parsed_rows: list[dict[str, Any]] = []
     for item in grid_results:
         parsed_rows.append(

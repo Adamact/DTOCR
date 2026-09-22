@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+        continue-on-error: true
+
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile all sources
+        run: python -m compileall -q core db gui parsers services shared web scripts
+
+      - name: Parser unit checks
+        # The parsers depend only on the standard library, so they can be
+        # exercised without installing torch or the other heavy runtime deps.
+        run: |
+          cd ..
+          python -c "
+          from DTOCR.parsers.registry import available_parsers, get_parser
+          from DTOCR.parsers import vendor_parsers as vp
+          assert available_parsers() == ['grid-only', 'layout-a', 'layout-b'], available_parsers()
+          rows = [['1', 'Item', '2', 'ton', '10.00', '20.00'], ['Delivery date: 2026-01-01'], ['Bilregnr: ab123']]
+          recs, carry = vp.parse_structured_rows_layout_a_with_carry(rows, None)
+          assert carry and carry['vehicle_id'] == 'AB123', carry
+          recs, carry = vp.parse_structured_rows_layout_b_with_carry([['Belopp SEK'], ['1 02-14 ABC12 Sand ton 2,0 50,00 100,00']], None)
+          assert carry and carry['vehicle_id'] == 'ABC12', carry
+          print('parser checks OK')
+          "
+
+  privacy-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject client names, personal paths and committed databases
+        run: |
+          set -e
+          fail=0
+
+          # Client / organisation names that must never re-enter the codebase.
+          if git grep -nEi '\b(layout-b|layout-a|layout-c)\b' -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::A client or organisation name was found in the source tree."
+            fail=1
+          fi
+
+          # Absolute local paths leak usernames and real document locations.
+          if git grep -nE '[A-Za-z]:[\\/]Users[\\/]|/home/[a-z]+/|/Users/[a-z]+/' -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::An absolute local filesystem path was found."
+            fail=1
+          fi
+
+          # Template payloads embed absolute source-PDF paths; never commit the DB.
+          if git ls-files | grep -E '\.sqlite3?$'; then
+            echo "::error::A database file is tracked in git."
+            fail=1
+          fi
+
+          exit $fail

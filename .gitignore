@@ -1,11 +1,16 @@
 # Virtual environment
 .venv/
+venv/
+env/
 
-# Python cache
+# Python cache / build
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+build/
+dist/
+*.egg-info/
 
 # IDE
 .vscode/
@@ -17,3 +22,23 @@ Thumbs.db
 
 # Runtime artifacts
 storage/
+*.log
+
+# Local database — recreated from db/schema.sql on first run.
+# Never commit this: template payloads embed absolute source-PDF paths.
+data/*.sqlite3
+data/*.sqlite3-journal
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+
+# Local template exports and scratch data
+data/vendor_configs/
+*.xlsx
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Tooling
+.omc/

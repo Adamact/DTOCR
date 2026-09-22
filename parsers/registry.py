@@ -1,3 +1,10 @@
+"""Registry of the document layout parsers available to templates.
+
+A template stores a ``parser_name``; this module maps that name to the callable
+that parses it, the column order used for Excel export, and an optional filter
+that drops incomplete rows.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -30,18 +37,18 @@ def _has_value(value: Any) -> bool:
 
 
 def _keep_row_layout_a(row: dict[str, Any]) -> bool:
-    return _has_value(row.get("bilregnr")) and _has_value(row.get("delivery_date"))
+    return _has_value(row.get("vehicle_id")) and _has_value(row.get("delivery_date"))
 
 
 def _keep_row_layout_b(row: dict[str, Any]) -> bool:
-    return _has_value(row.get("bilnr")) and _has_value(row.get("levdag"))
+    return _has_value(row.get("vehicle_id")) and _has_value(row.get("delivery_date"))
 
 
 _PARSERS: dict[str, ParserDefinition] = {
     "layout-a": ParserDefinition(
         name="layout-a",
-        parse_with_carry=vendor_parsers.parse_structured_rows_with_carry,
-        preferred_columns=["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"],
+        parse_with_carry=vendor_parsers.parse_structured_rows_layout_a_with_carry,
+        preferred_columns=["delivery_date", "vehicle_id", "description", "qty", "unit_price", "amount"],
         sheet_name="Parsed_Text",
         row_filter=_keep_row_layout_a,
     ),
@@ -49,24 +56,24 @@ _PARSERS: dict[str, ParserDefinition] = {
         name="layout-b",
         parse_with_carry=vendor_parsers.parse_structured_rows_layout_b_with_carry,
         preferred_columns=[
-            "foljesedel",
-            "levdag",
-            "bilnr",
-            "produktnamn",
-            "enhet",
-            "kvantitet",
-            "a_pris",
-            "belopp_sek",
-            "takt_miljoavgift",
-            "vintertillagg",
+            "delivery_note",
+            "delivery_date",
+            "vehicle_id",
+            "product_name",
+            "unit",
+            "quantity",
+            "unit_price",
+            "amount",
+            "surcharge_a",
+            "surcharge_b",
         ],
         sheet_name="Parsed_Text_LayoutB",
         row_filter=_keep_row_layout_b,
     ),
     "grid-only": ParserDefinition(
         name="grid-only",
-        parse_with_carry=vendor_parsers.parse_structured_rows_with_carry,
-        preferred_columns=["delivery_date", "bilregnr", "description", "qty", "unit_price", "amount"],
+        parse_with_carry=vendor_parsers.parse_structured_rows_layout_a_with_carry,
+        preferred_columns=["delivery_date", "vehicle_id", "description", "qty", "unit_price", "amount"],
         sheet_name="Parsed_Text",
         parse_grid=vendor_parsers.parse_grid_cells,
         grid_sheet_name="Parsed_Grid",
